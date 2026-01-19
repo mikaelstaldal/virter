@@ -2,16 +2,23 @@
 
 ## Setup image
 
-1. wget https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img
+Fetch https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img
+
+Run `./virter-setup.sh` and do this:
+
+1. Login with your username and password `password` 
 2. sudo systemctl disable ssh
 3. sudo systemctl disable ssh.socket
 4. sudo systemctl disable getty@tty1.service
-5. sudo nano /usr/lib/systemd/system/serial-getty@.service
-ExecStart=-/sbin/agetty -a $USER -o '-p -f -- \\u' --keep-baud 115200,57600,38400,9600 - $TERM
-ExecStart=/sbin/shutdown -h --no-wall now
-Type=oneshot
-Restart=no
-
+5. sudo nano /usr/lib/systemd/system/serial-getty@.service 
+   
+    ExecStart=-/sbin/agetty -a <your_username> -o '-p -f -- \\u' --keep-baud 115200,57600,38400,9600 - $TERM
+    ExecStart=/sbin/shutdown -h --no-wall now
+    Type=oneshot
+    Restart=no
+    
+6. sudo shutdown -h --no-wall now
+    
 ## License
 
 Copyright 2026 Mikael Ståldal.
