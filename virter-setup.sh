@@ -13,6 +13,7 @@ fi
 NAME=base
 UUID=$(uuid)
 MEMORY_MIB=1024
+DISK_MIB=4096
 TIMEZONE=$(cat /etc/timezone)
 
 CACHE_HOME=${XDG_CACHE_HOME-${HOME}/.cache}
@@ -59,6 +60,7 @@ EOF
 (cd "$TEMP_DIR" && genisoimage -output "${NAME}-seed.img" -volid cidata -rational-rock -joliet meta-data network-config vendor-data user-data)
 
 cp "$BASE_IMAGE" "$CACHE_DIR/base.img"
+qemu-img resize "$CACHE_DIR/base.img" ${DISK_MIB}M
 
 qemu-system-x86_64 \
   -name "$NAME" -uuid "$UUID" -pidfile "${NAME}.pid" \
