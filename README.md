@@ -1,5 +1,13 @@
 # virter
 
+## Prerequisites
+
+- Ubuntu 24.04 or later
+
+```bash
+sudo apt install python3 qemu-system-x86 qemu-utils genisoimage
+```
+
 ## Setup image
 
 Fetch https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img
