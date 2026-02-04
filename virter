@@ -5,7 +5,6 @@ import getpass
 import os
 import shutil
 import subprocess
-import sys
 import tempfile
 import time
 import uuid
@@ -133,7 +132,6 @@ def run(args):
 
 
 def cloud_init_prepare(name: str, temp_dir: Path):
-    cols, rows = shutil.get_terminal_size()
     generate_cloud_init(
         name,
         temp_dir,
@@ -234,7 +232,7 @@ def prepare_cache_dir() -> Path:
     return cache_dir
 
 
-def run_vm(name: str, vm_uuid: str, image: Path, cloud_init: Path, memory_mib: int, is_prepare: bool):
+def run_vm(name: str, vm_uuid: str, image: Path, cloud_init_image: Path, memory_mib: int, is_prepare: bool):
     subprocess.run(
         [
             "qemu-system-x86_64",
@@ -255,7 +253,7 @@ def run_vm(name: str, vm_uuid: str, image: Path, cloud_init: Path, memory_mib: i
             "-drive",
             f"file={str(image)},index=0,format=qcow2,media=disk",
             "-drive",
-            f"file={str(cloud_init)},index=1,media=cdrom",
+            f"file={str(cloud_init_image)},index=1,media=cdrom",
             "-nographic",
             "-qmp",
             "null",
