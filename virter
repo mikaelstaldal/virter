@@ -62,7 +62,6 @@ def update(args):
 def prepare_or_update(base_image: Optional[Path], base: str, memory_mib: int, disk_mib: Optional[int]) -> None:
     name = base
     vm_uuid = str(uuid.uuid4())
-    timezone = read_timezone()
 
     cache_dir = prepare_cache_dir()
 
@@ -84,29 +83,13 @@ def prepare_or_update(base_image: Optional[Path], base: str, memory_mib: int, di
 
     temp_dir = Path(tempfile.mkdtemp())
     try:
-        generate_cloud_init(
-            name,
-            temp_dir,
-            [
-                "#cloud-config",
-                "growpart:",
-                "  mode: auto",
-                "  devices: [/]",
-                "  ignore_growroot_disabled: false",
-                "manage_etc_hosts: true",
-                f"timezone: {timezone}",
-                "user:",
-                f"  name: \"{getpass.getuser()}\"",
-                f"  uid: \"{os.getuid()}\"",
-                "  lock_passwd: False",
-                "  plain_text_passwd: password",
-                "  groups: [adm, cdrom, dip, lxd, sudo]",
-                "  sudo: [\"ALL=(ALL) NOPASSWD:ALL\"]",
-                "  shell: /bin/bash",
-            ]
-        )
+        if base_image:
+            cloud_init_prepare(name, temp_dir)
+        else:
+            cloud_init(name, temp_dir)
 
-        run_vm(name, vm_uuid, cache_dir / f"{base}.img", temp_dir / f"{name}-seed.img", memory_mib)
+        run_vm(name, vm_uuid, cache_dir / f"{base}.img", temp_dir / f"{name}-seed.img", memory_mib,
+               base_image is not None)
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
@@ -117,7 +100,6 @@ def run(args):
     memory_mib = args.memory
 
     vm_uuid = str(uuid.uuid4())
-    timezone = read_timezone()
 
     cache_dir = prepare_cache_dir()
 
@@ -140,22 +122,9 @@ def run(args):
             f"{name}.img",
         ], cwd=None, check=True)
 
-        generate_cloud_init(
-            name,
-            temp_dir,
-            [
-                "#cloud-config",
-                "growpart:",
-                "  mode: auto",
-                "  devices: [/]",
-                "  ignore_growroot_disabled: false",
-                "manage_etc_hosts: true",
-                f"timezone: {timezone}",
-                "users: []",
-            ]
-        )
+        cloud_init(name, temp_dir)
 
-        run_vm(name, vm_uuid, Path(f"{name}.img"), temp_dir / f"{name}-seed.img", memory_mib)
+        run_vm(name, vm_uuid, Path(f"{name}.img"), temp_dir / f"{name}-seed.img", memory_mib, is_prepare=False)
     finally:
         img_path = Path(f"{name}.img")
         if img_path.exists():
@@ -163,22 +132,53 @@ def run(args):
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
+def cloud_init_prepare(name: str, temp_dir: Path):
+    cols, rows = shutil.get_terminal_size()
+    generate_cloud_init(
+        name,
+        temp_dir,
+        [
+            "#cloud-config",
+            "growpart:",
+            "  mode: auto",
+            "  devices: [/]",
+            "  ignore_growroot_disabled: false",
+            "manage_etc_hosts: true",
+            f"timezone: {read_timezone()}",
+            "user:",
+            f"  name: \"{getpass.getuser()}\"",
+            f"  uid: \"{os.getuid()}\"",
+            "  lock_passwd: False",
+            "  plain_text_passwd: password",
+            "  groups: [adm, cdrom, dip, lxd, sudo]",
+            "  sudo: [\"ALL=(ALL) NOPASSWD:ALL\"]",
+            "  shell: /bin/bash",
+        ]
+    )
+
+
+def cloud_init(name, temp_dir: Path):
+    generate_cloud_init(
+        name,
+        temp_dir,
+        [
+            "#cloud-config",
+            "growpart:",
+            "  mode: auto",
+            "  devices: [/]",
+            "  ignore_growroot_disabled: false",
+            "manage_etc_hosts: true",
+            f"timezone: {read_timezone()}",
+            "users: []",
+        ]
+    )
+
+
 def read_timezone():
     try:
         return Path("/etc/timezone").read_text(encoding="utf-8").strip()
     except FileNotFoundError:
         return ""
-
-
-def stdio_is_pty() -> bool:
-    return sys.stdin.isatty() and sys.stdout.isatty()
-
-
-def prepare_cache_dir() -> Path:
-    cache_home = os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))
-    cache_dir = Path(cache_home) / "virter"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    return cache_dir
 
 
 def generate_cloud_init(name: str, temp_dir: Path, vendor_data: List[str]):
@@ -227,35 +227,54 @@ def write_text_file(file: Path, lines: list[str]):
     file.write_text("\n".join(lines + [""]), encoding="utf-8")
 
 
-def run_vm(name: str, vm_uuid: str, image: Path, cloud_init: Path, memory_mib: int):
-    subprocess.run([
-        "qemu-system-x86_64",
-        "-name",
-        name,
-        "-uuid",
-        vm_uuid,
-        "-pidfile",
-        f"{name}.pid",
-        "-cpu",
-        "host",
-        "-accel",
-        "kvm",
-        "-m",
-        str(memory_mib),
-        "-nic",
-        f"user,hostname={name}",
-        "-drive",
-        f"file={str(image)},index=0,format=qcow2,media=disk",
-        "-drive",
-        f"file={str(cloud_init)},index=1,media=cdrom",
-        "-qmp",
-        "null",
-        "-chardev",
-        "stdio,id=stdio,signal=off",
-        "-serial",
-        "chardev:stdio",
-        "-nographic",
-    ], cwd=None, check=True)
+def prepare_cache_dir() -> Path:
+    cache_home = os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))
+    cache_dir = Path(cache_home) / "virter"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir
+
+
+def run_vm(name: str, vm_uuid: str, image: Path, cloud_init: Path, memory_mib: int, is_prepare: bool):
+    subprocess.run(
+        [
+            "qemu-system-x86_64",
+            "-name",
+            name,
+            "-uuid",
+            vm_uuid,
+            "-pidfile",
+            f"{name}.pid",
+            "-cpu",
+            "host",
+            "-accel",
+            "kvm",
+            "-m",
+            str(memory_mib),
+            "-nic",
+            f"user,hostname={name}",
+            "-drive",
+            f"file={str(image)},index=0,format=qcow2,media=disk",
+            "-drive",
+            f"file={str(cloud_init)},index=1,media=cdrom",
+            "-nographic",
+            "-qmp",
+            "null",
+            "-chardev",
+            "stdio,id=stdio,signal=off",
+        ] + ([
+                 "-serial",
+                 "chardev:stdio",
+             ]
+             if is_prepare else
+             [
+                 "-serial",
+                 "null",
+                 "-serial",
+                 "chardev:stdio",
+             ]),
+        cwd=None,
+        check=True
+    )
 
 
 if __name__ == "__main__":
