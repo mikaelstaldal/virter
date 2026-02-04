@@ -17,7 +17,8 @@ Run `./virter setup -b $BASE_IMAGE` and do this:
     Type=oneshot
     Restart=no
     
-6. sudo shutdown -h --no-wall now
+6. sudo passwd -d <your_username> 
+7. sudo shutdown -h --no-wall now
 
 ## Run an instance
 

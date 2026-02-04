@@ -9,18 +9,29 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
+from typing import Optional
 
 
 def main():
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers()
 
-    parser_setup = subparsers.add_parser("setup", help="Setup base image")
-    parser_setup.add_argument("-b", "--base-image", type=Path, help="Base image filename", required=True)
-    parser_setup.set_defaults(func=setup)
+    parser_prepare = subparsers.add_parser("prepare", help="Prepare base image")
+    parser_prepare.add_argument("-i", "--image", type=Path, help="Image filename", required=True)
+    parser_prepare.add_argument("-b", "--base", help="The base to prepare", default="base")
+    parser_prepare.add_argument("-m", "--memory", type=int, help="Memory in MiB", default=1024)
+    parser_prepare.add_argument("-d", "--disk", type=int, help="Disk in MiB", default=4096)
+    parser_prepare.set_defaults(func=prepare)
+
+    parser_update = subparsers.add_parser("update", help="Update base image")
+    parser_update.add_argument("-b", "--base", help="The base to update", default="base")
+    parser_update.add_argument("-m", "--memory", type=int, help="Memory in MiB", default=1024)
+    parser_update.set_defaults(func=update)
 
     parser_run = subparsers.add_parser("run", help="Run an instance")
     parser_run.add_argument("-n", "--name", help="Name of the instance", default=f"instance-{int(time.time())}")
+    parser_run.add_argument("-b", "--base", help="The base to use", default="base")
+    parser_run.add_argument("-m", "--memory", type=int, help="Memory in MiB", default=1024)
     parser_run.set_defaults(func=run)
 
     args = parser.parse_args()
@@ -30,19 +41,37 @@ def main():
         parser.print_help()
 
 
-def setup(args):
-    base_image = args.base_image
+def prepare(args):
+    base_image = args.image
     if not base_image.is_file():
         print("Base image not found")
         raise SystemExit(1)
+    base = args.base
+    memory_mib = args.memory
+    disk_mib = args.disk
+    prepare_or_update(base_image, base, memory_mib, disk_mib)
 
-    name = "base"
+
+def update(args):
+    base = args.base
+    memory_mib = args.memory
+    prepare_or_update(None, base, memory_mib, None)
+
+
+def prepare_or_update(base_image: Optional[Path], base: str, memory_mib: int, disk_mib: Optional[int]) -> None:
+    name = base
     vm_uuid = str(uuid.uuid4())
-    memory_mib = 1024
-    disk_mib = 4096
     timezone = read_timezone()
 
     cache_dir = prepare_cache_dir()
+
+    if base_image:
+        shutil.copy(base_image, cache_dir / f"{base}.img")
+        subprocess.run(["qemu-img", "resize", str(cache_dir / f"{base}.img"), f"{disk_mib}M"], cwd=None, check=True)
+    else:
+        if not (cache_dir / f"{base}.img").is_file():
+            print(f"Base {base} not found")
+            raise SystemExit(1)
 
     temp_dir = Path(tempfile.mkdtemp())
     try:
@@ -104,9 +133,6 @@ def setup(args):
             "user-data",
         ], cwd=(str(temp_dir)), check=True)
 
-        shutil.copy(base_image, cache_dir / "base.img")
-        subprocess.run(["qemu-img", "resize", str(cache_dir / "base.img"), f"{disk_mib}M"], cwd=None, check=True)
-
         subprocess.run([
             "qemu-system-x86_64",
             "-name",
@@ -124,7 +150,7 @@ def setup(args):
             "-nic",
             f"user,hostname={name}",
             "-drive",
-            f"file={cache_dir / 'base.img'},index=0,format=qcow2,media=disk",
+            f"file={cache_dir / f"{base}.img"},index=0,format=qcow2,media=disk",
             "-drive",
             f"file={temp_dir}/{name}-seed.img,index=1,media=cdrom",
             "-qmp",
@@ -141,12 +167,17 @@ def setup(args):
 
 def run(args):
     name = args.name
+    base = args.base
+    memory_mib = args.memory
 
     vm_uuid = str(uuid.uuid4())
-    memory_mib = 1024
     timezone = read_timezone()
 
     cache_dir = prepare_cache_dir()
+
+    if not (cache_dir / f"{base}.img").is_file():
+        print(f"Base {base} not found")
+        raise SystemExit(1)
 
     temp_dir = Path(tempfile.mkdtemp())
     try:
@@ -207,7 +238,7 @@ def run(args):
             "-f",
             "qcow2",
             "-b",
-            str(cache_dir / "base.img"),
+            str(cache_dir / f"{base}.img"),
             "-F",
             "qcow2",
             f"{name}.img",
