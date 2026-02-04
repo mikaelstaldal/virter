@@ -5,11 +5,12 @@ import getpass
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 
 
 def main():
@@ -67,7 +68,15 @@ def prepare_or_update(base_image: Optional[Path], base: str, memory_mib: int, di
 
     if base_image:
         shutil.copy(base_image, cache_dir / f"{base}.img")
-        subprocess.run(["qemu-img", "resize", str(cache_dir / f"{base}.img"), f"{disk_mib}M"], cwd=None, check=True)
+        subprocess.run([
+            "qemu-img",
+            "resize",
+            "-q",
+            str(cache_dir / f"{base}.img"),
+            f"{disk_mib}M"
+        ],
+            cwd=None,
+            check=True)
     else:
         if not (cache_dir / f"{base}.img").is_file():
             print(f"Base {base} not found")
@@ -75,24 +84,9 @@ def prepare_or_update(base_image: Optional[Path], base: str, memory_mib: int, di
 
     temp_dir = Path(tempfile.mkdtemp())
     try:
-        write_text_file(
-            temp_dir / "meta-data",
-            [
-                "#cloud-config",
-                f"instance-id: {name}",
-                f"local-hostname: {name}",
-                "cloud-name: virter",
-            ]
-        )
-        write_text_file(
-            temp_dir / "network-config",
-            [
-                "#cloud-config",
-                "{}",
-            ]
-        )
-        write_text_file(
-            temp_dir / "vendor-data",
+        generate_cloud_init(
+            name,
+            temp_dir,
             [
                 "#cloud-config",
                 "growpart:",
@@ -111,56 +105,8 @@ def prepare_or_update(base_image: Optional[Path], base: str, memory_mib: int, di
                 "  shell: /bin/bash",
             ]
         )
-        write_text_file(
-            temp_dir / "user-data",
-            [
-                "#cloud-config",
-                "{}"
-            ]
-        )
 
-        subprocess.run([
-            "genisoimage",
-            "-output",
-            f"{name}-seed.img",
-            "-volid",
-            "cidata",
-            "-rational-rock",
-            "-joliet",
-            "meta-data",
-            "network-config",
-            "vendor-data",
-            "user-data",
-        ], cwd=(str(temp_dir)), check=True)
-
-        subprocess.run([
-            "qemu-system-x86_64",
-            "-name",
-            name,
-            "-uuid",
-            vm_uuid,
-            "-pidfile",
-            f"{name}.pid",
-            "-cpu",
-            "host",
-            "-accel",
-            "kvm",
-            "-m",
-            str(memory_mib),
-            "-nic",
-            f"user,hostname={name}",
-            "-drive",
-            f"file={cache_dir / f"{base}.img"},index=0,format=qcow2,media=disk",
-            "-drive",
-            f"file={temp_dir}/{name}-seed.img,index=1,media=cdrom",
-            "-qmp",
-            "null",
-            "-chardev",
-            "stdio,id=stdio,signal=off",
-            "-serial",
-            "chardev:stdio",
-            "-nographic",
-        ], cwd=None, check=True)
+        run_vm(name, vm_uuid, cache_dir / f"{base}.img", temp_dir / f"{name}-seed.img", memory_mib)
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
@@ -181,24 +127,22 @@ def run(args):
 
     temp_dir = Path(tempfile.mkdtemp())
     try:
-        write_text_file(
-            temp_dir / "meta-data",
-            [
-                "#cloud-config",
-                f"instance-id: {name}",
-                f"local-hostname: {name}",
-                "cloud-name: virter",
-            ]
-        )
-        write_text_file(
-            temp_dir / "network-config",
-            [
-                "#cloud-config",
-                "{}",
-            ]
-        )
-        write_text_file(
-            temp_dir / "vendor-data",
+        subprocess.run([
+            "qemu-img",
+            "create",
+            "-q",
+            "-f",
+            "qcow2",
+            "-b",
+            str(cache_dir / f"{base}.img"),
+            "-F",
+            "qcow2",
+            f"{name}.img",
+        ], cwd=None, check=True)
+
+        generate_cloud_init(
+            name,
+            temp_dir,
             [
                 "#cloud-config",
                 "growpart:",
@@ -210,68 +154,8 @@ def run(args):
                 "users: []",
             ]
         )
-        write_text_file(
-            temp_dir / "user-data",
-            [
-                "#cloud-config",
-                "{}",
-            ]
-        )
 
-        subprocess.run([
-            "genisoimage",
-            "-output",
-            f"{name}-seed.img",
-            "-volid",
-            "cidata",
-            "-rational-rock",
-            "-joliet",
-            "meta-data",
-            "network-config",
-            "vendor-data",
-            "user-data",
-        ], cwd=(str(temp_dir)), check=True)
-
-        subprocess.run([
-            "qemu-img",
-            "create",
-            "-f",
-            "qcow2",
-            "-b",
-            str(cache_dir / f"{base}.img"),
-            "-F",
-            "qcow2",
-            f"{name}.img",
-        ], cwd=None, check=True)
-
-        subprocess.run([
-            "qemu-system-x86_64",
-            "-name",
-            name,
-            "-uuid",
-            vm_uuid,
-            "-pidfile",
-            f"{name}.pid",
-            "-cpu",
-            "host",
-            "-accel",
-            "kvm",
-            "-m",
-            str(memory_mib),
-            "-nic",
-            f"user,hostname={name}",
-            "-drive",
-            f"file={name}.img,index=0,format=qcow2,media=disk",
-            "-drive",
-            f"file={temp_dir}/{name}-seed.img,index=1,media=cdrom",
-            "-qmp",
-            "null",
-            "-chardev",
-            "stdio,id=stdio,signal=off",
-            "-serial",
-            "chardev:stdio",
-            "-nographic",
-        ], cwd=None, check=True)
+        run_vm(name, vm_uuid, Path(f"{name}.img"), temp_dir / f"{name}-seed.img", memory_mib)
     finally:
         img_path = Path(f"{name}.img")
         if img_path.exists():
@@ -286,6 +170,10 @@ def read_timezone():
         return ""
 
 
+def stdio_is_pty() -> bool:
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
 def prepare_cache_dir() -> Path:
     cache_home = os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))
     cache_dir = Path(cache_home) / "virter"
@@ -293,8 +181,81 @@ def prepare_cache_dir() -> Path:
     return cache_dir
 
 
+def generate_cloud_init(name: str, temp_dir: Path, vendor_data: List[str]):
+    write_text_file(
+        temp_dir / "meta-data",
+        [
+            "#cloud-config",
+            f"instance-id: {name}",
+            f"local-hostname: {name}",
+            "cloud-name: virter",
+        ]
+    )
+    write_text_file(
+        temp_dir / "network-config",
+        [
+            "#cloud-config",
+            "{}",
+        ]
+    )
+    write_text_file(temp_dir / "vendor-data", vendor_data)
+    write_text_file(
+        temp_dir / "user-data",
+        [
+            "#cloud-config",
+            "{}"
+        ]
+    )
+
+    subprocess.run([
+        "genisoimage",
+        "-quiet",
+        "-output",
+        f"{name}-seed.img",
+        "-volid",
+        "cidata",
+        "-rational-rock",
+        "-joliet",
+        "meta-data",
+        "network-config",
+        "vendor-data",
+        "user-data",
+    ], cwd=(str(temp_dir)), check=True)
+
+
 def write_text_file(file: Path, lines: list[str]):
     file.write_text("\n".join(lines + [""]), encoding="utf-8")
+
+
+def run_vm(name: str, vm_uuid: str, image: Path, cloud_init: Path, memory_mib: int):
+    subprocess.run([
+        "qemu-system-x86_64",
+        "-name",
+        name,
+        "-uuid",
+        vm_uuid,
+        "-pidfile",
+        f"{name}.pid",
+        "-cpu",
+        "host",
+        "-accel",
+        "kvm",
+        "-m",
+        str(memory_mib),
+        "-nic",
+        f"user,hostname={name}",
+        "-drive",
+        f"file={str(image)},index=0,format=qcow2,media=disk",
+        "-drive",
+        f"file={str(cloud_init)},index=1,media=cdrom",
+        "-qmp",
+        "null",
+        "-chardev",
+        "stdio,id=stdio,signal=off",
+        "-serial",
+        "chardev:stdio",
+        "-nographic",
+    ], cwd=None, check=True)
 
 
 if __name__ == "__main__":
