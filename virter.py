@@ -24,7 +24,10 @@ def main():
     parser_run.set_defaults(func=run)
 
     args = parser.parse_args()
-    args.func(args)
+    if hasattr(args, "func") and args.func:
+        args.func(args)
+    else:
+        parser.print_help()
 
 
 def setup(args):
@@ -39,54 +42,52 @@ def setup(args):
     disk_mib = 4096
     timezone = read_timezone()
 
-    cache_home = os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))
-    cache_dir = Path(cache_home) / "virter"
-    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_dir = prepare_cache_dir()
 
     temp_dir = Path(tempfile.mkdtemp())
     try:
-        (temp_dir / "meta-data").write_text(
-            "\n".join(
-                [
-                    "#cloud-config",
-                    f"instance-id: {name}",
-                    f"local-hostname: {name}",
-                    "cloud-name: virter",
-                    "",
-                ]
-            ),
-            encoding="utf-8",
+        write_text_file(
+            temp_dir / "meta-data",
+            [
+                "#cloud-config",
+                f"instance-id: {name}",
+                f"local-hostname: {name}",
+                "cloud-name: virter",
+            ]
         )
-        (temp_dir / "network-config").write_text(
-            "\n".join(["#cloud-config", "{}", ""]),
-            encoding="utf-8",
+        write_text_file(
+            temp_dir / "network-config",
+            [
+                "#cloud-config",
+                "{}",
+            ]
         )
-        (temp_dir / "vendor-data").write_text(
-            "\n".join(
-                [
-                    "#cloud-config",
-                    "growpart:",
-                    "  mode: auto",
-                    "  devices: [/]",
-                    "  ignore_growroot_disabled: false",
-                    "manage_etc_hosts: true",
-                    f"timezone: {timezone}",
-                    "user:",
-                    f"  name: \"{getpass.getuser()}\"",
-                    f"  uid: \"{os.getuid()}\"",
-                    "  lock_passwd: False",
-                    "  plain_text_passwd: password",
-                    "  groups: [adm, cdrom, dip, lxd, sudo]",
-                    "  sudo: [\"ALL=(ALL) NOPASSWD:ALL\"]",
-                    "  shell: /bin/bash",
-                    "",
-                ]
-            ),
-            encoding="utf-8",
+        write_text_file(
+            temp_dir / "vendor-data",
+            [
+                "#cloud-config",
+                "growpart:",
+                "  mode: auto",
+                "  devices: [/]",
+                "  ignore_growroot_disabled: false",
+                "manage_etc_hosts: true",
+                f"timezone: {timezone}",
+                "user:",
+                f"  name: \"{getpass.getuser()}\"",
+                f"  uid: \"{os.getuid()}\"",
+                "  lock_passwd: False",
+                "  plain_text_passwd: password",
+                "  groups: [adm, cdrom, dip, lxd, sudo]",
+                "  sudo: [\"ALL=(ALL) NOPASSWD:ALL\"]",
+                "  shell: /bin/bash",
+            ]
         )
-        (temp_dir / "user-data").write_text(
-            "\n".join(["#cloud-config", "{}", ""]),
-            encoding="utf-8",
+        write_text_file(
+            temp_dir / "user-data",
+            [
+                "#cloud-config",
+                "{}"
+            ]
         )
 
         subprocess.run([
@@ -145,47 +146,45 @@ def run(args):
     memory_mib = 1024
     timezone = read_timezone()
 
-    cache_home = os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))
-    cache_dir = Path(cache_home) / "virter"
-    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_dir = prepare_cache_dir()
 
     temp_dir = Path(tempfile.mkdtemp())
     try:
-        (temp_dir / "meta-data").write_text(
-            "\n".join(
-                [
-                    "#cloud-config",
-                    f"instance-id: {name}",
-                    f"local-hostname: {name}",
-                    "cloud-name: virter",
-                    "",
-                ]
-            ),
-            encoding="utf-8",
+        write_text_file(
+            temp_dir / "meta-data",
+            [
+                "#cloud-config",
+                f"instance-id: {name}",
+                f"local-hostname: {name}",
+                "cloud-name: virter",
+            ]
         )
-        (temp_dir / "network-config").write_text(
-            "\n".join(["#cloud-config", "{}", ""]),
-            encoding="utf-8",
+        write_text_file(
+            temp_dir / "network-config",
+            [
+                "#cloud-config",
+                "{}",
+            ]
         )
-        (temp_dir / "vendor-data").write_text(
-            "\n".join(
-                [
-                    "#cloud-config",
-                    "growpart:",
-                    "  mode: auto",
-                    "  devices: [/]",
-                    "  ignore_growroot_disabled: false",
-                    "manage_etc_hosts: true",
-                    f"timezone: {timezone}",
-                    "users: []",
-                    "",
-                ]
-            ),
-            encoding="utf-8",
+        write_text_file(
+            temp_dir / "vendor-data",
+            [
+                "#cloud-config",
+                "growpart:",
+                "  mode: auto",
+                "  devices: [/]",
+                "  ignore_growroot_disabled: false",
+                "manage_etc_hosts: true",
+                f"timezone: {timezone}",
+                "users: []",
+            ]
         )
-        (temp_dir / "user-data").write_text(
-            "\n".join(["#cloud-config", "{}", ""]),
-            encoding="utf-8",
+        write_text_file(
+            temp_dir / "user-data",
+            [
+                "#cloud-config",
+                "{}",
+            ]
         )
 
         subprocess.run([
@@ -254,6 +253,17 @@ def read_timezone():
         return Path("/etc/timezone").read_text(encoding="utf-8").strip()
     except FileNotFoundError:
         return ""
+
+
+def prepare_cache_dir() -> Path:
+    cache_home = os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))
+    cache_dir = Path(cache_home) / "virter"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir
+
+
+def write_text_file(file: Path, lines: list[str]):
+    file.write_text("\n".join(lines + [""]), encoding="utf-8")
 
 
 if __name__ == "__main__":
