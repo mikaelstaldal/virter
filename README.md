@@ -4,7 +4,7 @@
 
 Fetch https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img
 
-Run `./virter.py setup -b $BASE_IMAGE` and do this:
+Run `./virter setup -b $BASE_IMAGE` and do this:
 
 1. Login with your username and password `password` 
 2. sudo systemctl disable ssh
@@ -21,7 +21,7 @@ Run `./virter.py setup -b $BASE_IMAGE` and do this:
 
 ## Run an instance
 
-Run `./virter.py run`
+Run `./virter run`
     
 ## License
 
