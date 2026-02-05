@@ -14,9 +14,13 @@ Fetch https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.
 
 Run `./virter prepare -i $BASE_IMAGE`
 
-## Run an instance
+## Run an instance with an interactive shell
 
 Run `./virter run`
+
+## Run an instance with a command and then exit
+
+Run `./virter run -- ls -A /`
     
 ## License
 

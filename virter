@@ -32,6 +32,8 @@ def main():
     parser_run.add_argument("-n", "--name", help="Name of the instance", default=f"instance-{int(time.time())}")
     parser_run.add_argument("-b", "--base", help="The base to use", default="base")
     parser_run.add_argument("-m", "--memory", type=int, help="Memory in MiB", default=1024)
+    parser_run.add_argument("COMMAND", nargs="?", help="Command to run")
+    parser_run.add_argument("ARG", nargs="*", help="Arguments to command")
     parser_run.set_defaults(func=run)
 
     args = parser.parse_args()
@@ -85,7 +87,7 @@ def prepare_or_update(base_image: Optional[Path], base: str, memory_mib: int, di
         if base_image:
             cloud_init_prepare(name, temp_dir)
         else:
-            cloud_init(name, temp_dir)
+            cloud_init_update(name, temp_dir)
 
         run_vm(name, vm_uuid, cache_dir / f"{base}.img", temp_dir / f"{name}-seed.img", memory_mib,
                base_image is not None)
@@ -121,7 +123,26 @@ def run(args):
             f"{name}.img",
         ], cwd=None, check=True)
 
-        cloud_init(name, temp_dir)
+        username = getpass.getuser()
+        user_data = f"""write_files:
+- path: \"/home/{username}/.hushlogin\"  
+- path: \"/home/{username}/.profile\"
+  content: |
+    {args.COMMAND} {' '.join(args.ARG)}
+    logout    
+""" if args.COMMAND else ""
+
+        generate_cloud_init(
+            name,
+            temp_dir,
+            vendor_data=f"""#cloud-config
+growpart:
+  mode: auto
+  devices: [/]
+  ignore_growroot_disabled: false
+manage_etc_hosts: true
+users: []
+""" + user_data)
 
         run_vm(name, vm_uuid, Path(f"{name}.img"), temp_dir / f"{name}-seed.img", memory_mib, is_prepare=False)
     finally:
@@ -207,7 +228,7 @@ power_state:
     )
 
 
-def cloud_init(name, temp_dir: Path):
+def cloud_init_update(name, temp_dir: Path):
     generate_cloud_init(
         name,
         temp_dir,
