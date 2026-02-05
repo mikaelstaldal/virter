@@ -9,7 +9,7 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional
 
 
 def main():
@@ -135,23 +135,22 @@ def cloud_init_prepare(name: str, temp_dir: Path):
     generate_cloud_init(
         name,
         temp_dir,
-        [
-            "#cloud-config",
-            "growpart:",
-            "  mode: auto",
-            "  devices: [/]",
-            "  ignore_growroot_disabled: false",
-            "manage_etc_hosts: true",
-            f"timezone: {read_timezone()}",
-            "user:",
-            f"  name: \"{getpass.getuser()}\"",
-            f"  uid: \"{os.getuid()}\"",
-            "  lock_passwd: False",
-            "  plain_text_passwd: password",
-            "  groups: [adm, cdrom, dip, lxd, sudo]",
-            "  sudo: [\"ALL=(ALL) NOPASSWD:ALL\"]",
-            "  shell: /bin/bash",
-        ]
+        f"""#cloud-config
+growpart:
+  mode: auto
+  devices: [/]
+  ignore_growroot_disabled: false
+manage_etc_hosts: true
+timezone: {read_timezone()}
+user:
+  name: \"{getpass.getuser()}\"
+  uid: \"{os.getuid()}\"
+  lock_passwd: False
+  plain_text_passwd: password
+  groups: [adm, cdrom, dip, lxd, sudo]
+  sudo: [\"ALL=(ALL) NOPASSWD:ALL\"]
+  shell: /bin/bash
+"""
     )
 
 
@@ -159,16 +158,15 @@ def cloud_init(name, temp_dir: Path):
     generate_cloud_init(
         name,
         temp_dir,
-        [
-            "#cloud-config",
-            "growpart:",
-            "  mode: auto",
-            "  devices: [/]",
-            "  ignore_growroot_disabled: false",
-            "manage_etc_hosts: true",
-            f"timezone: {read_timezone()}",
-            "users: []",
-        ]
+        f"""#cloud-config
+growpart:
+  mode: auto
+  devices: [/]
+  ignore_growroot_disabled: false
+manage_etc_hosts: true
+timezone: {read_timezone()}
+users: []
+"""
     )
 
 
@@ -179,31 +177,19 @@ def read_timezone():
         return ""
 
 
-def generate_cloud_init(name: str, temp_dir: Path, vendor_data: List[str]):
-    write_text_file(
-        temp_dir / "meta-data",
-        [
-            "#cloud-config",
-            f"instance-id: {name}",
-            f"local-hostname: {name}",
-            "cloud-name: virter",
-        ]
-    )
-    write_text_file(
-        temp_dir / "network-config",
-        [
-            "#cloud-config",
-            "{}",
-        ]
-    )
-    write_text_file(temp_dir / "vendor-data", vendor_data)
-    write_text_file(
-        temp_dir / "user-data",
-        [
-            "#cloud-config",
-            "{}"
-        ]
-    )
+def generate_cloud_init(name: str, temp_dir: Path, vendor_data: str):
+    (temp_dir / "meta-data").write_text(f"""#cloud-config
+instance-id: {name}
+local-hostname: {name}
+cloud-name: virter
+""", encoding="utf-8")
+    (temp_dir / "network-config").write_text("""#cloud-config
+{}
+""", encoding="utf-8")
+    (temp_dir / "vendor-data").write_text(vendor_data, encoding="utf-8")
+    (temp_dir / "user-data").write_text("""#cloud-config
+{}
+""", encoding="utf-8")
 
     subprocess.run([
         "genisoimage",
@@ -219,10 +205,6 @@ def generate_cloud_init(name: str, temp_dir: Path, vendor_data: List[str]):
         "vendor-data",
         "user-data",
     ], cwd=(str(temp_dir)), check=True)
-
-
-def write_text_file(file: Path, lines: list[str]):
-    file.write_text("\n".join(lines + [""]), encoding="utf-8")
 
 
 def prepare_cache_dir() -> Path:
