@@ -132,6 +132,8 @@ def run(args):
 
 
 def cloud_init_prepare(name: str, temp_dir: Path):
+    username = getpass.getuser()
+    cols, rows = shutil.get_terminal_size()
     generate_cloud_init(
         name,
         temp_dir,
@@ -143,13 +145,64 @@ growpart:
 manage_etc_hosts: true
 timezone: {read_timezone()}
 user:
-  name: \"{getpass.getuser()}\"
+  name: \"{username}\"
   uid: \"{os.getuid()}\"
-  lock_passwd: False
-  plain_text_passwd: password
   groups: [adm, cdrom, dip, lxd, sudo]
   sudo: [\"ALL=(ALL) NOPASSWD:ALL\"]
   shell: /bin/bash
+package_update: true
+package_upgrade: true
+write_files:
+- path: /usr/lib/systemd/system/serial-getty@.service  
+  content: |
+    [Unit]
+    Description=Serial Getty on %I
+    Documentation=man:agetty(8) man:systemd-getty-generator(8)
+    Documentation=https://0pointer.de/blog/projects/serial-console.html
+    BindsTo=dev-%i.device
+    After=dev-%i.device systemd-user-sessions.service plymouth-quit-wait.service getty-pre.target
+    After=rc-local.service
+    Before=getty.target
+    IgnoreOnIsolate=yes
+    Conflicts=rescue.service
+    Before=rescue.service    
+    [Service]
+    ExecStart=-/sbin/agetty --noissue --noclear -a {username} -o '-p -f -- \\\\u' --keep-baud 115200,57600,38400,9600 - $TERM
+    ExecStart=/sbin/shutdown -h --no-wall now
+    Type=oneshot
+    Restart=no
+    UtmpIdentifier=%I
+    StandardInput=tty
+    StandardOutput=tty
+    TTYPath=/dev/%I
+    TTYReset=yes
+    TTYVHangup=yes
+    TTYColumns={cols}
+    TTYRows={rows}
+    IgnoreSIGPIPE=no
+    SendSIGHUP=yes
+    ImportCredential=agetty.*
+    ImportCredential=login.*    
+    [Install]
+    WantedBy=getty.target
+- path: /etc/default/grub.d/50-cloudimg-settings.cfg
+  content: |
+    GRUB_RECORDFAIL_TIMEOUT=0
+    GRUB_TIMEOUT=0
+    GRUB_CMDLINE_LINUX_DEFAULT="quiet console=ttyS0 systemd.getty_auto=no"
+    GRUB_TERMINAL=console      
+runcmd:
+ - systemctl disable ssh
+ - systemctl disable ssh.socket
+ - systemctl disable getty@tty1.service
+ - systemctl disable serial-getty@ttyS0.service
+ - systemctl enable serial-getty@ttyS1.service
+ - update-grub 
+power_state:
+  delay: now
+  mode: poweroff
+  timeout: 10
+  condition: true
 """
     )
 
@@ -164,7 +217,6 @@ growpart:
   devices: [/]
   ignore_growroot_disabled: false
 manage_etc_hosts: true
-timezone: {read_timezone()}
 users: []
 """
     )

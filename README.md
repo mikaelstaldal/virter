@@ -8,33 +8,11 @@
 sudo apt install python3 qemu-system-x86 qemu-utils genisoimage
 ```
 
-## Setup image
+## Prepare image
 
 Fetch https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img
 
-Run `./virter setup -b $BASE_IMAGE` and do this:
-
-1. Login with your username and password `password`
-2. sudo nano /boot/grub/grub.cfg
-
-    linux   /vmlinuz-6.8.0-90-generic root=LABEL=cloudimg-rootfs ro quiet console=ttyS0 systemd.getty_auto=no
-
-3. sudo systemctl disable ssh
-4. sudo systemctl disable ssh.socket
-5. sudo systemctl disable getty@tty1.service
-6. sudo nano /usr/lib/systemd/system/serial-getty@.service 
-   
-    ExecStart=-/sbin/agetty --noissue --noclear -a <your_username> -o '-p -f -- \\u' --keep-baud 115200,57600,38400,9600 - $TERM
-    ExecStart=/sbin/shutdown -h --no-wall now
-    Type=oneshot
-    Restart=no
-    TTYColumns=120 # desired terminal size
-    TTYRows=50     # desired terminal size
-
-7. sudo systemctl disable serial-getty@ttyS0.service
-8. sudo systemctl enable serial-getty@ttyS1.service 
-9. sudo passwd -d <your_username> 
-10. sudo shutdown -h --no-wall now
+Run `./virter prepare -i $BASE_IMAGE`
 
 ## Run an instance
 
