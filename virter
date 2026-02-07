@@ -32,6 +32,9 @@ def main():
     parser_run.add_argument("-n", "--name", help="Name of the instance", default=f"instance-{int(time.time())}")
     parser_run.add_argument("-b", "--base", help="The base to use", default="base")
     parser_run.add_argument("-m", "--memory", type=int, help="Memory in MiB", default=1024)
+    mounts = parser_run.add_mutually_exclusive_group()
+    mounts.add_argument("--mount", type=Path, help="Mount directory in VM read-only")
+    mounts.add_argument("--mount-writable", type=Path, help="Mount directory in VM writable")
     parser_run.add_argument("COMMAND", nargs="?", help="Command to run")
     parser_run.add_argument("ARG", nargs="*", help="Arguments to command")
     parser_run.set_defaults(func=run)
@@ -47,7 +50,7 @@ def prepare(args):
     base_image = args.image
     if not base_image.is_file():
         print("Base image not found")
-        raise SystemExit(1)
+        exit(1)
     base = args.base
     memory_mib = args.memory
     disk_mib = args.disk
@@ -80,7 +83,7 @@ def prepare_or_update(base_image: Optional[Path], base: str, memory_mib: int, di
     else:
         if not (cache_dir / f"{base}.img").is_file():
             print(f"Base {base} not found")
-            raise SystemExit(1)
+            exit(1)
 
     temp_dir = Path(tempfile.mkdtemp())
     try:
@@ -90,7 +93,7 @@ def prepare_or_update(base_image: Optional[Path], base: str, memory_mib: int, di
             cloud_init_update(name, temp_dir)
 
         run_vm(name, vm_uuid, cache_dir / f"{base}.img", temp_dir / f"{name}-seed.img", memory_mib,
-               base_image is not None)
+               base_image is not None, None)
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
@@ -99,6 +102,13 @@ def run(args):
     name = args.name
     base = args.base
     memory_mib = args.memory
+    mount_dir = args.mount_writable if args.mount_writable is not None else args.mount
+    if mount_dir is not None:
+        mount_dir = mount_dir.resolve()
+        if not mount_dir.is_dir():
+            print(f"Directory {mount_dir} not found")
+            exit(1)
+    mount_readonly = args.mount is not None
 
     vm_uuid = str(uuid.uuid4())
 
@@ -106,7 +116,7 @@ def run(args):
 
     if not (cache_dir / f"{base}.img").is_file():
         print(f"Base {base} not found")
-        raise SystemExit(1)
+        exit(1)
 
     temp_dir = Path(tempfile.mkdtemp())
     try:
@@ -123,8 +133,13 @@ def run(args):
             f"{name}.img",
         ], cwd=None, check=True)
 
+        mount_data = f"""bootcmd:
+- mkdir -p "{mount_dir}"         
+- mount -t virtiofs {"-o ro" if mount_readonly else ""} virtiofs "{mount_dir}"
+""" if mount_dir else ""
+
         username = getpass.getuser()
-        user_data = f"""write_files:
+        command_data = f"""write_files:
 - path: \"/home/{username}/.hushlogin\"  
 - path: \"/home/{username}/.profile\"
   content: |
@@ -142,9 +157,10 @@ growpart:
   ignore_growroot_disabled: false
 manage_etc_hosts: true
 users: []
-""" + user_data)
+""" + mount_data + command_data)
 
-        run_vm(name, vm_uuid, Path(f"{name}.img"), temp_dir / f"{name}-seed.img", memory_mib, is_prepare=False)
+        run_vm(name, vm_uuid, Path(f"{name}.img"), temp_dir / f"{name}-seed.img", memory_mib, is_prepare=False,
+               mount_dir=mount_dir)
     finally:
         img_path = Path(f"{name}.img")
         if img_path.exists():
@@ -287,7 +303,13 @@ def prepare_cache_dir() -> Path:
     return cache_dir
 
 
-def run_vm(name: str, vm_uuid: str, image: Path, cloud_init_image: Path, memory_mib: int, is_prepare: bool):
+def run_vm(name: str, vm_uuid: str, image: Path, cloud_init_image: Path, memory_mib: int, is_prepare: bool,
+           mount_dir: Optional[Path]):
+    virtiofsd = None
+    if mount_dir is not None:
+        virtiofsd = subprocess.Popen(
+            ["/usr/libexec/virtiofsd", "--log-level", "off", "--socket-path", "/tmp/vhostqemu", "--shared-dir",
+             mount_dir])
     subprocess.run(
         [
             "qemu-system-x86_64",
@@ -296,7 +318,7 @@ def run_vm(name: str, vm_uuid: str, image: Path, cloud_init_image: Path, memory_
             "-pidfile", f"{name}.pid",
             "-cpu", "host",
             "-accel", "kvm",
-            "-m", str(memory_mib),
+            "-m", f"{str(memory_mib)}M",
             "-nic", f"user,hostname={name}",
             "-drive", f"file={str(image)},index=0,format=qcow2,media=disk",
             "-drive", f"file={str(cloud_init_image)},index=1,media=cdrom",
@@ -311,10 +333,17 @@ def run_vm(name: str, vm_uuid: str, image: Path, cloud_init_image: Path, memory_
              [
                  "-serial", "null",
                  "-serial", "chardev:stdio",
-             ]),
+             ]) + ([
+                       "-chardev", "socket,id=char0,path=/tmp/vhostqemu",
+                       "-device", "vhost-user-fs-pci,queue-size=1024,chardev=char0,tag=virtiofs",
+                       "-object", f"memory-backend-file,id=mem,size={str(memory_mib)}M,mem-path=/dev/shm,share=on",
+                       "-numa", "node,memdev=mem",
+                   ] if mount_dir is not None else []),
         cwd=None,
         check=True
     )
+    if virtiofsd is not None:
+        virtiofsd.wait()
 
 
 if __name__ == "__main__":

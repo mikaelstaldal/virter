@@ -5,7 +5,7 @@
 - Ubuntu 24.04 or later
 
 ```bash
-sudo apt install python3 qemu-system-x86 qemu-utils genisoimage
+sudo apt install python3 qemu-system-x86 qemu-utils genisoimage virtiofsd
 ```
 
 ## Prepare image
