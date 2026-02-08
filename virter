@@ -31,10 +31,13 @@ def main():
     parser_run = subparsers.add_parser("run", help="Run an instance")
     parser_run.add_argument("-n", "--name", help="Name of the instance", default=f"instance-{int(time.time())}")
     parser_run.add_argument("-b", "--base", help="The base to use", default="base")
-    parser_run.add_argument("-m", "--memory", type=int, help="Memory in MiB", default=1024)
+    parser_run.add_argument("-m", "--memory", type=int, metavar="MiB", help="Memory in MiB", default=1024)
     mounts = parser_run.add_mutually_exclusive_group()
-    mounts.add_argument("--mount", type=Path, help="Mount directory in VM read-only")
-    mounts.add_argument("--mount-writable", type=Path, help="Mount directory in VM writable")
+    mounts.add_argument("--mount", type=Path, metavar="DIR", help="Mount a directory in VM read-only")
+    mounts.add_argument("--mount-writable", type=Path, metavar="DIR", help="Mount a directory in VM writable")
+    mounts.add_argument("--current-dir", action='store_true', help="Mount the current directory in VM read-only")
+    mounts.add_argument("--current-dir-writable", action='store_true',
+                        help="Mount the current directory in VM writable")
     parser_run.add_argument("COMMAND", nargs="?", help="Command to run")
     parser_run.add_argument("ARG", nargs="*", help="Arguments to command")
     parser_run.set_defaults(func=run)
@@ -93,7 +96,7 @@ def prepare_or_update(base_image: Optional[Path], base: str, memory_mib: int, di
             cloud_init_update(name, temp_dir)
 
         run_vm(name, vm_uuid, cache_dir / f"{base}.img", temp_dir / f"{name}-seed.img", memory_mib,
-               base_image is not None, None)
+               base_image is not None, None, False)
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
@@ -102,13 +105,15 @@ def run(args):
     name = args.name
     base = args.base
     memory_mib = args.memory
-    mount_dir = args.mount_writable if args.mount_writable is not None else args.mount
+    mount_dir = args.mount_writable if args.mount_writable is not None \
+        else args.mount if args.mount is not None \
+        else Path(".") if args.current_dir or args.current_dir_writable else None
     if mount_dir is not None:
         mount_dir = mount_dir.resolve()
         if not mount_dir.is_dir():
             print(f"Directory {mount_dir} not found")
             exit(1)
-    mount_readonly = args.mount is not None
+    mount_readonly = args.mount is not None or args.current_dir
 
     vm_uuid = str(uuid.uuid4())
 
@@ -160,7 +165,7 @@ users: []
 """ + mount_data + command_data)
 
         run_vm(name, vm_uuid, Path(f"{name}.img"), temp_dir / f"{name}-seed.img", memory_mib, is_prepare=False,
-               mount_dir=mount_dir)
+               mount_dir=mount_dir, mount_readonly=mount_readonly)
     finally:
         img_path = Path(f"{name}.img")
         if img_path.exists():
@@ -304,12 +309,12 @@ def prepare_cache_dir() -> Path:
 
 
 def run_vm(name: str, vm_uuid: str, image: Path, cloud_init_image: Path, memory_mib: int, is_prepare: bool,
-           mount_dir: Optional[Path]):
+           mount_dir: Optional[Path], mount_readonly: bool):
     virtiofsd = None
     if mount_dir is not None:
         virtiofsd = subprocess.Popen(
             ["/usr/libexec/virtiofsd", "--log-level", "off", "--socket-path", "/tmp/vhostqemu", "--shared-dir",
-             mount_dir])
+             mount_dir] + (["--readonly"] if mount_readonly else []))
     subprocess.run(
         [
             "qemu-system-x86_64",
