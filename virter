@@ -9,7 +9,7 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 
 
 def main():
@@ -21,6 +21,7 @@ def main():
     parser_prepare.add_argument("-b", "--base", help="The base to prepare", default="base")
     parser_prepare.add_argument("-m", "--memory", type=int, metavar="MiB", help="Memory in MiB", default=1024)
     parser_prepare.add_argument("-d", "--disk", type=int, metavar="MiB", help="Disk in MiB", default=4096)
+    parser_prepare.add_argument("-p", "--packages", nargs='+', metavar="PKG", help="Packages to install", default=[])
     parser_prepare.set_defaults(func=prepare)
 
     parser_update = subparsers.add_parser("update", help="Update base image")
@@ -57,16 +58,17 @@ def prepare(args):
     base = args.base
     memory_mib = args.memory
     disk_mib = args.disk
-    prepare_or_update(base_image, base, memory_mib, disk_mib)
+    packages = args.packages
+    prepare_or_update(base_image, base, memory_mib, disk_mib, packages)
 
 
 def update(args):
     base = args.base
     memory_mib = args.memory
-    prepare_or_update(None, base, memory_mib, None)
+    prepare_or_update(None, base, memory_mib, None, [])
 
 
-def prepare_or_update(base_image: Optional[Path], base: str, memory_mib: int, disk_mib: Optional[int]) -> None:
+def prepare_or_update(base_image: Optional[Path], base: str, memory_mib: int, disk_mib: Optional[int], packages: List[str]) -> None:
     name = base
     vm_uuid = str(uuid.uuid4())
 
@@ -91,7 +93,7 @@ def prepare_or_update(base_image: Optional[Path], base: str, memory_mib: int, di
     temp_dir = Path(tempfile.mkdtemp())
     try:
         if base_image:
-            cloud_init_prepare(name, temp_dir)
+            cloud_init_prepare(name, temp_dir, packages)
         else:
             cloud_init_update(name, temp_dir)
 
@@ -173,7 +175,7 @@ users: []
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
-def cloud_init_prepare(name: str, temp_dir: Path):
+def cloud_init_prepare(name: str, temp_dir: Path, packages: List[str]):
     username = getpass.getuser()
     cols, rows = shutil.get_terminal_size()
     generate_cloud_init(
@@ -194,6 +196,7 @@ user:
   shell: /bin/bash
 package_update: true
 package_upgrade: true
+packages: {packages}
 write_files:
 - path: /usr/lib/systemd/system/serial-getty@.service  
   content: |
