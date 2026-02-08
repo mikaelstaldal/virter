@@ -17,15 +17,15 @@ def main():
     subparsers = parser.add_subparsers()
 
     parser_prepare = subparsers.add_parser("prepare", help="Prepare base image")
-    parser_prepare.add_argument("-i", "--image", type=Path, help="Image filename", required=True)
+    parser_prepare.add_argument("-i", "--image", type=Path, metavar="FILE", help="Image filename", required=True)
     parser_prepare.add_argument("-b", "--base", help="The base to prepare", default="base")
-    parser_prepare.add_argument("-m", "--memory", type=int, help="Memory in MiB", default=1024)
-    parser_prepare.add_argument("-d", "--disk", type=int, help="Disk in MiB", default=4096)
+    parser_prepare.add_argument("-m", "--memory", type=int, metavar="MiB", help="Memory in MiB", default=1024)
+    parser_prepare.add_argument("-d", "--disk", type=int, metavar="MiB", help="Disk in MiB", default=4096)
     parser_prepare.set_defaults(func=prepare)
 
     parser_update = subparsers.add_parser("update", help="Update base image")
     parser_update.add_argument("-b", "--base", help="The base to update", default="base")
-    parser_update.add_argument("-m", "--memory", type=int, help="Memory in MiB", default=1024)
+    parser_update.add_argument("-m", "--memory", type=int, metavar="MiB", help="Memory in MiB", default=1024)
     parser_update.set_defaults(func=update)
 
     parser_run = subparsers.add_parser("run", help="Run an instance")
