@@ -21,6 +21,8 @@ Run `./virter run`
 ## Run an instance with a command and then exit
 
 Run `./virter run -- ls -A /`
+
+Both stdout and stderr from the instance will end up in stdout from the virter command.
     
 ## License
 
