@@ -169,6 +169,7 @@ def run(args):
         command_data = f"""write_files:
 - path: \"/home/{username}/.hushlogin\"
 - path: \"/home/{username}/.profile\"
+  append: true
   content: |
 """ + "".join(f"    {line}\n" for line in profile_lines) if profile_lines else ""
 
