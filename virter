@@ -40,6 +40,7 @@ def main():
     parser_run.add_argument("-b", "--base", help="The base to use", default="base")
     parser_run.add_argument("-m", "--memory", type=int, metavar="MiB", help="Memory in MiB", default=1024)
     parser_run.add_argument("--network", choices=["host", "none"], default="host", help="Network mode")
+    parser_run.add_argument("-w", "--workdir", metavar="DIR", help="Change to this directory inside the VM")
     mounts = parser_run.add_mutually_exclusive_group()
     mounts.add_argument("--mount", type=Path, metavar="DIR", help="Mount a directory in VM read-only")
     mounts.add_argument("--mount-writable", type=Path, metavar="DIR", help="Mount a directory in VM writable")
@@ -159,13 +160,17 @@ def run(args):
 """ if mount_dir else ""
 
         username = getpass.getuser()
+        profile_lines = []
+        if args.workdir:
+            profile_lines.append(f'cd "{args.workdir}"')
+        if args.COMMAND:
+            profile_lines.append(f"{args.COMMAND} {' '.join(args.ARG)}".rstrip())
+            profile_lines.append("logout")
         command_data = f"""write_files:
-- path: \"/home/{username}/.hushlogin\"  
+- path: \"/home/{username}/.hushlogin\"
 - path: \"/home/{username}/.profile\"
   content: |
-    {args.COMMAND} {' '.join(args.ARG)}
-    logout    
-""" if args.COMMAND else ""
+""" + "".join(f"    {line}\n" for line in profile_lines) if profile_lines else ""
 
         generate_cloud_init(
             name,
