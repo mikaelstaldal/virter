@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- Ubuntu 24.04 or later
+- Ubuntu 26.04 or later
 
 ```bash
 sudo apt install python3 qemu-system-x86 qemu-utils genisoimage virtiofsd
@@ -10,7 +10,7 @@ sudo apt install python3 qemu-system-x86 qemu-utils genisoimage virtiofsd
 
 ## Prepare image automatically
 
-Fetch https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img
+Fetch https://cloud-images.ubuntu.com/resolute/current/resolute-server-cloudimg-amd64.img
 
 ```bash
 ./virter prepare -i $BASE_IMAGE
@@ -55,8 +55,6 @@ Both stdout and stderr from the instance will end up in stdout from the virter c
 ./virter run --mount DIR
 ./virter run --current-dir
 ```
-
-**Note:** This requires a newer version of `virtiofsd` than the one in Ubuntu 24.04. 
     
 ## License
 

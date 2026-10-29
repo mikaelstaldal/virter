@@ -26,7 +26,7 @@ def main():
     parser_prepare.add_argument("-i", "--image", type=Path, metavar="FILE", help="Image filename", required=True)
     parser_prepare.add_argument("-b", "--base", help="The base to prepare", default="base")
     parser_prepare.add_argument("-m", "--memory", type=int, metavar="MiB", help="Memory in MiB", default=1024)
-    parser_prepare.add_argument("-d", "--disk", type=int, metavar="MiB", help="Disk in MiB", default=4096)
+    parser_prepare.add_argument("-d", "--disk", type=int, metavar="MiB", help="Disk in MiB", default=8192)
     parser_prepare.add_argument("-p", "--packages", nargs='+', metavar="PKG", help="Packages to install", default=[])
     parser_prepare.set_defaults(func=prepare)
 
@@ -220,7 +220,7 @@ package_update: true
 package_upgrade: true
 packages: {packages}
 write_files:
-- path: /usr/lib/systemd/system/serial-getty@.service  
+- path: /etc/systemd/system/serial-getty@.service
   content: |
     [Unit]
     Description=Serial Getty on %I
@@ -248,8 +248,11 @@ write_files:
     TTYRows={rows}
     IgnoreSIGPIPE=no
     SendSIGHUP=yes
+    ImportCredential=tty.serial.%I.agetty.*:agetty.
+    ImportCredential=tty.serial.%I.login.*:login.
     ImportCredential=agetty.*
-    ImportCredential=login.*    
+    ImportCredential=login.*
+    ImportCredential=shell.*
     [Install]
     WantedBy=getty.target
 - path: /etc/default/grub.d/50-cloudimg-settings.cfg
@@ -290,6 +293,14 @@ users: []
 
 
 def read_timezone():
+    # /etc/localtime is a symlink like ../usr/share/zoneinfo/Europe/Stockholm
+    try:
+        target = os.readlink("/etc/localtime")
+        _, sep, zone = target.partition("zoneinfo/")
+        if sep and zone:
+            return zone
+    except OSError:
+        pass
     try:
         return Path("/etc/timezone").read_text(encoding="utf-8").strip()
     except FileNotFoundError:

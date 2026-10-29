@@ -3,7 +3,7 @@
 ## Project overview
 - This repo is a single executable Python script: `virter`.
 - It manages QEMU-based VMs and cloud-init seed images.
-- OS target is Ubuntu 24.04+ (see `README.md`).
+- OS target is Ubuntu 26.04+ (see `README.md`).
 
 ## Working agreements
 - Keep the script executable and preserve the `#!/usr/bin/env python3` shebang.
