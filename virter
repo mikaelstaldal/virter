@@ -81,12 +81,15 @@ def main():
     parser_run.add_argument("-m", "--memory", type=int, metavar="MiB", help="Memory in MiB", default=1024)
     parser_run.add_argument("--network", choices=["host", "none"], default="host", help="Network mode")
     parser_run.add_argument("-w", "--workdir", metavar="DIR", help="Change to this directory inside the VM")
-    mounts = parser_run.add_mutually_exclusive_group()
-    mounts.add_argument("--mount", type=Path, metavar="DIR", help="Mount a directory in VM read-only")
-    mounts.add_argument("--mount-writable", type=Path, metavar="DIR", help="Mount a directory in VM writable")
-    mounts.add_argument("--current-dir", action='store_true', help="Mount the current directory in VM read-only")
-    mounts.add_argument("--current-dir-writable", action='store_true',
-                        help="Mount the current directory in VM writable")
+    parser_run.add_argument("--mount", type=Path, metavar="DIR", action="append", default=[],
+                            help="Mount a directory in VM read-only, can be repeated")
+    parser_run.add_argument("--mount-writable", type=Path, metavar="DIR", action="append", default=[],
+                            help="Mount a directory in VM writable, can be repeated")
+    current_dir_mounts = parser_run.add_mutually_exclusive_group()
+    current_dir_mounts.add_argument("--current-dir", action='store_true',
+                                    help="Mount the current directory in VM read-only")
+    current_dir_mounts.add_argument("--current-dir-writable", action='store_true',
+                                    help="Mount the current directory in VM writable")
     parser_run.add_argument("COMMAND", nargs="?", help="Command to run")
     parser_run.add_argument("ARG", nargs="*", help="Arguments to command")
     parser_run.set_defaults(func=run)
@@ -144,7 +147,7 @@ def prepare_or_update(base_image: Path | None, base: str, memory_mib: int, disk_
             cloud_init_update(name, temp_dir)
 
         run_vm(name, vm_uuid, base_path, temp_dir, memory_mib, NetworkMode.HOST,
-               base_image is not None, None, False, ephemeral=False)
+               base_image is not None, mounts=[], ephemeral=False)
     finally:
         pid_path = cache_dir / f"{name}.pid"
         if pid_path.exists():
@@ -152,19 +155,30 @@ def prepare_or_update(base_image: Path | None, base: str, memory_mib: int, disk_
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
+def collect_mounts(args) -> list[tuple[Path, bool]]:
+    requested = [(path, True) for path in args.mount] + [(path, False) for path in args.mount_writable]
+    if args.current_dir or args.current_dir_writable:
+        requested.append((Path("."), args.current_dir))
+
+    mounts = {}
+    for path, readonly in requested:
+        mount_dir = path.resolve()
+        if not mount_dir.is_dir():
+            sys.exit(f"Directory {mount_dir} not found")
+        if mount_dir in mounts:
+            sys.exit(f"Directory {mount_dir} specified more than once")
+        mounts[mount_dir] = readonly
+
+    # A parent must be mounted before its subdirectories, otherwise it would hide them
+    return sorted(mounts.items(), key=lambda mount: len(mount[0].parts))
+
+
 def run(args):
     name = args.name
     base = args.base
     memory_mib = args.memory
     network = NetworkMode(args.network)
-    mount_dir = args.mount_writable if args.mount_writable is not None \
-        else args.mount if args.mount is not None \
-        else Path(".") if args.current_dir or args.current_dir_writable else None
-    if mount_dir is not None:
-        mount_dir = mount_dir.resolve()
-        if not mount_dir.is_dir():
-            sys.exit(f"Directory {mount_dir} not found")
-    mount_readonly = args.mount is not None or args.current_dir
+    mounts = collect_mounts(args)
 
     vm_uuid = str(uuid.uuid4())
 
@@ -194,10 +208,9 @@ def run(args):
             str(img_path),
         ], check=True)
 
-        mount_data = f"""bootcmd:
-- mkdir -p "{mount_dir}"         
-- mount -t virtiofs {"-o ro" if mount_readonly else ""} virtiofs "{mount_dir}"
-""" if mount_dir else ""
+        mount_data = "bootcmd:\n" + "".join(f"""- mkdir -p "{mount_dir}"
+- mount -t virtiofs {"-o ro" if mount_readonly else ""} virtiofs{i} "{mount_dir}"
+""" for i, (mount_dir, mount_readonly) in enumerate(mounts)) if mounts else ""
 
         username = getpass.getuser()
         cols, rows = shutil.get_terminal_size()
@@ -224,7 +237,7 @@ def run(args):
             vendor_data=CLOUD_CONFIG_HEADER + "users: []\n" + mount_data + command_data)
 
         run_vm(name, vm_uuid, img_path, temp_dir, memory_mib, network, is_prepare=False,
-               mount_dir=mount_dir, mount_readonly=mount_readonly, ephemeral=True)
+               mounts=mounts, ephemeral=True)
     finally:
         if img_path.exists():
             img_path.unlink()
@@ -344,16 +357,20 @@ def prepare_cache_dir() -> Path:
     return cache_dir
 
 
+def wait_for_socket(process: subprocess.Popen, socket_path: Path, timeout_seconds: float = 5):
+    deadline = time.monotonic() + timeout_seconds
+    while not socket_path.exists():
+        if process.poll() is not None:
+            sys.exit(f"virtiofsd exited with status {process.returncode}")
+        if time.monotonic() > deadline:
+            sys.exit(f"Timed out waiting for virtiofsd socket {socket_path}")
+        time.sleep(0.01)
+
+
 def run_vm(name: str, vm_uuid: str, image: Path, temp_dir: Path, memory_mib: int, network: NetworkMode,
-           is_prepare: bool, mount_dir: Path | None, mount_readonly: bool, ephemeral: bool):
+           is_prepare: bool, mounts: list[tuple[Path, bool]], ephemeral: bool):
     cache_dir = prepare_cache_dir()
     cloud_init_image = temp_dir / f"{name}-seed.img"
-    virtiofs_socket = temp_dir / "vhostqemu"
-    virtiofsd = None
-    if mount_dir is not None:
-        virtiofsd = subprocess.Popen(
-            ["/usr/libexec/virtiofsd", "--log-level", "off", "--socket-path", virtiofs_socket, "--shared-dir",
-             mount_dir] + (["--readonly"] if mount_readonly else []))
 
     network_params = []
     match network:
@@ -362,7 +379,21 @@ def run_vm(name: str, vm_uuid: str, image: Path, temp_dir: Path, memory_mib: int
         case NetworkMode.NONE:
             network_params = ["-nic", "none"]
 
+    virtiofsds = []
+    virtiofs_params = []
     try:
+        for i, (mount_dir, mount_readonly) in enumerate(mounts):
+            virtiofs_socket = temp_dir / f"vhostqemu{i}"
+            virtiofsd = subprocess.Popen(
+                ["/usr/libexec/virtiofsd", "--log-level", "off", "--socket-path", virtiofs_socket, "--shared-dir",
+                 mount_dir] + (["--readonly"] if mount_readonly else []))
+            virtiofsds.append(virtiofsd)
+            wait_for_socket(virtiofsd, virtiofs_socket)
+            virtiofs_params += [
+                "-chardev", f"socket,id=char{i},path={virtiofs_socket}",
+                "-device", f"vhost-user-fs-pci,queue-size=1024,chardev=char{i},tag=virtiofs{i}",
+            ]
+
         subprocess.run(
             [
                 "qemu-system-x86_64",
@@ -390,17 +421,16 @@ def run_vm(name: str, vm_uuid: str, image: Path, temp_dir: Path, memory_mib: int
                  "-serial", "null",
                  "-serial", "chardev:stdio",
              ]) +
+            virtiofs_params +
             ([
-                 "-chardev", f"socket,id=char0,path={virtiofs_socket}",
-                 "-device", "vhost-user-fs-pci,queue-size=1024,chardev=char0,tag=virtiofs",
                  "-object",
                  f"memory-backend-file,id=mem,size={memory_mib}M,mem-path=/dev/shm,share=on",
                  "-numa", "node,memdev=mem",
-             ] if mount_dir is not None else []),
+             ] if mounts else []),
             check=True
         )
     finally:
-        if virtiofsd is not None:
+        for virtiofsd in virtiofsds:
             virtiofsd.terminate()
             virtiofsd.wait()
         # The guest can power off in the middle of an escape sequence, then the terminal would swallow what follows

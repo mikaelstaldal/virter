@@ -55,6 +55,15 @@ Both stdout and stderr from the instance will end up in stdout from the virter c
 ./virter run --mount DIR
 ./virter run --current-dir
 ```
+
+### With several directories on the host mounted
+
+`--mount` and `--mount-writable` can be repeated and combined with each other and with one of the current directory
+options. Each directory appears at the same path inside the instance as on the host.
+
+```bash
+./virter run --mount DIR1 --mount DIR2 --mount-writable DIR3 --current-dir-writable
+```
     
 ## License
 
