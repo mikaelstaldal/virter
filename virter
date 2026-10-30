@@ -17,7 +17,39 @@ from pathlib import Path
 
 CLOUD_CONFIG_HEADER = """#cloud-config
 manage_etc_hosts: true
+ssh_deletekeys: false
+ssh_genkeytypes: []
 """
+
+# Not needed in a short-lived VM, masked rather than purged since purging would also remove any requested
+# packages depending on them
+UNNEEDED_UNITS = [
+    "apport.service",
+    "apt-daily.timer",
+    "apt-daily-upgrade.timer",
+    "dpkg-db-backup.timer",
+    "e2scrub_all.timer",
+    "fstrim.timer",
+    "fwupd-refresh.timer",
+    "logrotate.timer",
+    "man-db.timer",
+    "ModemManager.service",
+    "motd-news.timer",
+    "multipathd.service",
+    "multipathd.socket",
+    "multipathd-queueing.service",
+    "networkd-dispatcher.service",
+    "rsyslog.service",
+    "sysstat.service",
+    "sysstat-collect.timer",
+    "sysstat-rotate.timer",
+    "sysstat-summary.timer",
+    "udisks2.service",
+    "unattended-upgrades.service",
+    "update-notifier-download.timer",
+    "update-notifier-motd.timer",
+    "xfs_scrub_all.timer",
+]
 
 
 class NetworkMode(StrEnum):
@@ -112,7 +144,7 @@ def prepare_or_update(base_image: Path | None, base: str, memory_mib: int, disk_
             cloud_init_update(name, temp_dir)
 
         run_vm(name, vm_uuid, base_path, temp_dir, memory_mib, NetworkMode.HOST,
-               base_image is not None, None, False)
+               base_image is not None, None, False, ephemeral=False)
     finally:
         pid_path = cache_dir / f"{name}.pid"
         if pid_path.exists():
@@ -174,6 +206,9 @@ def run(args):
             profile_lines.append(f"cd {shlex.quote(args.workdir)}")
         if args.COMMAND:
             profile_lines.append(shlex.join([args.COMMAND, *args.ARG]))
+            # The image is discarded, so skip the slow orderly shutdown. Drain the serial output first, a
+            # forced poweroff would otherwise cut it off. If the poweroff fails, logout shuts down normally.
+            profile_lines.append('sync; stty "$(stty -g)"; sudo poweroff -ff >/dev/null 2>&1')
             profile_lines.append("logout")
         hushlogin_data = f"""- path: \"/home/{username}/.hushlogin\"
 """ if args.workdir or args.COMMAND else ""
@@ -189,7 +224,7 @@ def run(args):
             vendor_data=CLOUD_CONFIG_HEADER + "users: []\n" + mount_data + command_data)
 
         run_vm(name, vm_uuid, img_path, temp_dir, memory_mib, network, is_prepare=False,
-               mount_dir=mount_dir, mount_readonly=mount_readonly)
+               mount_dir=mount_dir, mount_readonly=mount_readonly, ephemeral=True)
     finally:
         if img_path.exists():
             img_path.unlink()
@@ -234,8 +269,8 @@ write_files:
     GRUB_CMDLINE_LINUX_DEFAULT="quiet console=ttyS0 systemd.getty_auto=no"
     GRUB_TERMINAL=console      
 runcmd:
- - systemctl disable ssh
- - systemctl disable ssh.socket
+ - DEBIAN_FRONTEND=noninteractive apt-get purge -y openssh-server
+ - systemctl mask {" ".join(UNNEEDED_UNITS)}
  - systemctl disable getty@tty1.service
  - systemctl disable serial-getty@ttyS0.service
  - systemctl enable serial-getty@ttyS1.service
@@ -310,7 +345,7 @@ def prepare_cache_dir() -> Path:
 
 
 def run_vm(name: str, vm_uuid: str, image: Path, temp_dir: Path, memory_mib: int, network: NetworkMode,
-           is_prepare: bool, mount_dir: Path | None, mount_readonly: bool):
+           is_prepare: bool, mount_dir: Path | None, mount_readonly: bool, ephemeral: bool):
     cache_dir = prepare_cache_dir()
     cloud_init_image = temp_dir / f"{name}-seed.img"
     virtiofs_socket = temp_dir / "vhostqemu"
@@ -323,7 +358,7 @@ def run_vm(name: str, vm_uuid: str, image: Path, temp_dir: Path, memory_mib: int
     network_params = []
     match network:
         case NetworkMode.HOST:
-            network_params = ["-nic", f"user,hostname={name}"]
+            network_params = ["-nic", f"user,hostname={name},model=virtio-net-pci"]
         case NetworkMode.NONE:
             network_params = ["-nic", "none"]
 
@@ -336,8 +371,11 @@ def run_vm(name: str, vm_uuid: str, image: Path, temp_dir: Path, memory_mib: int
                 "-pidfile", str(cache_dir / f"{name}.pid"),
                 "-cpu", "host",
                 "-accel", "kvm",
+                "-smp", "4",
                 "-m", f"{memory_mib}M",
-                "-drive", f"file={image},index=0,format=qcow2,media=disk",
+                # Writes to an ephemeral image are discarded on exit, so there is no need to wait for flushes
+                "-drive", f"file={image},if=virtio,index=0,format=qcow2,media=disk"
+                          + (",cache=unsafe" if ephemeral else ""),
                 "-drive", f"file={cloud_init_image},index=1,media=cdrom",
                 "-sandbox", "on",
                 "-nographic",
@@ -365,6 +403,10 @@ def run_vm(name: str, vm_uuid: str, image: Path, temp_dir: Path, memory_mib: int
         if virtiofsd is not None:
             virtiofsd.terminate()
             virtiofsd.wait()
+        # The guest can power off in the middle of an escape sequence, then the terminal would swallow what follows
+        if sys.stdout.isatty():
+            sys.stdout.write("\x1b\\")
+            sys.stdout.flush()
 
 
 if __name__ == "__main__":
