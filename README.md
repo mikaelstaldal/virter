@@ -5,8 +5,29 @@
 - Ubuntu 26.04 or later
 
 ```bash
-sudo apt install python3 qemu-system-x86 qemu-utils genisoimage virtiofsd
+sudo apt install python3 qemu-system-x86 qemu-utils genisoimage virtiofsd bubblewrap
 ```
+
+## Host confinement
+
+Run virter as an ordinary user with access to `/dev/kvm`; root execution is refused.
+Every QEMU launch requires Bubblewrap and working unprivileged user namespaces. Failure to create the sandbox
+aborts the launch; there is no unconfined fallback. Ubuntu's AppArmor policy must permit the packaged `bwrap`
+to create user namespaces.
+
+QEMU runs with separate user, mount, PID, IPC and UTS namespaces, no capabilities, a cleared environment,
+and explicit seccomp restrictions. Its filesystem contains read-only system runtime files, a private `/tmp`
+and `/dev/shm`, `/dev/kvm`, the instance directory and the required disk images. Ephemeral instances see their
+base image read-only; `prepare` and `update` can write their selected base image. Other cache images and the
+user's home are not exposed. Host networking is retained only with `--network host` (also used for image updates).
+This exposes host loopback services and abstract Unix sockets to QEMU; use `--network none` for offline runs.
+A non-VM confinement preflight checks namespace creation and KVM device visibility before modifying images.
+The host QEMU process cannot create additional user namespaces inside its Bubblewrap sandbox.
+This does not restrict user namespaces or containers inside the VM, which runs its own kernel.
+
+Directory sharing uses a separate virtiofsd process running as the invoking user, outside this QEMU sandbox.
+A shared directory deliberately grants the guest access to its contents according to the requested mount mode.
+Confinement is defense in depth and does not protect against host kernel vulnerabilities.
 
 ## Prepare image automatically
 

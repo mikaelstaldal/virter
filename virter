@@ -144,6 +144,19 @@ def main():
 
     args = parser.parse_args()
     if args.func:
+        if os.getuid() == 0 or os.geteuid() == 0:
+            parser.error("virter must run as an unprivileged user; do not use sudo")
+        if shutil.which("bwrap") is None:
+            parser.error("Bubblewrap (bwrap) is required for QEMU confinement")
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                temporary = Path(directory)
+                subprocess.run(qemu_confinement(temporary / "disk.img", temporary, NetworkMode.NONE, None)
+                               + ["/usr/bin/true"], check=True, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.PIPE, text=True)
+        except (OSError, subprocess.CalledProcessError) as error:
+            detail = error.stderr if isinstance(error, subprocess.CalledProcessError) else str(error)
+            parser.error(f"QEMU confinement preflight failed: {detail}")
         args.func(args)
     else:
         parser.print_help()
@@ -289,7 +302,7 @@ def run(args):
             vendor_data=CLOUD_CONFIG_HEADER + "users: []\n" + mount_data + command_data)
 
         run_vm(name, vm_uuid, img_path, temp_dir, memory_mib, network, is_prepare=False,
-               mounts=mounts, ephemeral=True)
+               mounts=mounts, ephemeral=True, backing_image=base_path)
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
@@ -414,8 +427,33 @@ def wait_for_socket(process: subprocess.Popen, socket_path: Path, timeout_second
         time.sleep(0.01)
 
 
+def qemu_confinement(image: Path, temp_dir: Path, network: NetworkMode,
+                     backing_image: Path | None) -> list[str]:
+    command = [
+        "bwrap", "--unshare-all", "--unshare-user", "--disable-userns", "--assert-userns-disabled",
+        "--die-with-parent",
+        "--cap-drop", "ALL", "--clearenv",
+        "--setenv", "PATH", "/usr/bin:/bin", "--setenv", "HOME", "/tmp",
+        "--setenv", "LC_ALL", "C.UTF-8",
+        "--ro-bind", "/usr", "/usr",
+        "--symlink", "usr/bin", "/bin", "--symlink", "usr/sbin", "/sbin",
+        "--symlink", "usr/lib", "/lib", "--ro-bind-try", "/lib64", "/lib64",
+        "--proc", "/proc", "--dev", "/dev", "--dev-bind", "/dev/kvm", "/dev/kvm",
+        "--tmpfs", "/dev/shm", "--tmpfs", "/tmp", "--chdir", "/tmp",
+    ]
+    if network == NetworkMode.HOST:
+        command += ["--share-net", "--ro-bind-try", "/etc/resolv.conf", "/etc/resolv.conf"]
+    if backing_image is not None:
+        command += ["--ro-bind", str(backing_image), str(backing_image)]
+    command += ["--bind", str(temp_dir), str(temp_dir)]
+    if not image.is_relative_to(temp_dir):
+        command += ["--bind", str(image), str(image)]
+    return command + ["--"]
+
+
 def run_vm(name: str, vm_uuid: str, image: Path, temp_dir: Path, memory_mib: int, network: NetworkMode,
-           is_prepare: bool, mounts: list[tuple[Path, bool]], ephemeral: bool):
+           is_prepare: bool, mounts: list[tuple[Path, bool]], ephemeral: bool,
+           backing_image: Path | None = None):
     cloud_init_image = temp_dir / "seed.img"
 
     network_params = []
@@ -441,8 +479,8 @@ def run_vm(name: str, vm_uuid: str, image: Path, temp_dir: Path, memory_mib: int
             ]
 
         subprocess.run(
-            [
-                "qemu-system-x86_64",
+            qemu_confinement(image, temp_dir, network, backing_image) + [
+                "/usr/bin/qemu-system-x86_64",
                 "-name", name,
                 "-uuid", vm_uuid,
                 "-cpu", "host",
@@ -453,7 +491,7 @@ def run_vm(name: str, vm_uuid: str, image: Path, temp_dir: Path, memory_mib: int
                 "-drive", f"file={qemu_value(image)},if=virtio,index=0,format=qcow2,media=disk"
                           + (",cache=unsafe" if ephemeral else ""),
                 "-drive", f"file={qemu_value(cloud_init_image)},index=1,media=cdrom",
-                "-sandbox", "on",
+                "-sandbox", "on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny",
                 "-nographic",
                 "-qmp", "null",
                 "-chardev", "stdio,id=stdio,signal=off",
