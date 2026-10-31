@@ -2,6 +2,7 @@
 
 import argparse
 import getpass
+import hashlib
 import json
 import os
 import re
@@ -77,6 +78,31 @@ def qemu_value(value: Path) -> str:
     return str(value).replace(",", ",,")
 
 
+def sha256_digest(value: str) -> str:
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", value):
+        raise argparse.ArgumentTypeError("SHA-256 must contain exactly 64 hexadecimal digits")
+    return value.lower()
+
+
+def validate_import(image: Path, expected_sha256: str | None) -> None:
+    with image.open("rb") as source:
+        if expected_sha256 is None or hashlib.file_digest(source, "sha256").hexdigest() != expected_sha256:
+            sys.exit("Image SHA-256 does not match the authenticated checksum")
+        source.seek(0)
+        header = source.read(104)
+    version = int.from_bytes(header[4:8], "big")
+    if len(header) < 72 or header[:4] != b"QFI\xfb" or version not in (2, 3):
+        sys.exit("Only trusted standalone QCOW2 version 2 or 3 images are supported")
+    if int.from_bytes(header[8:20], "big"):
+        sys.exit("Images with backing files are not supported")
+    if version == 3:
+        if len(header) < 104 or int.from_bytes(header[100:104], "big") < 104:
+            sys.exit("Invalid QCOW2 version 3 header")
+        # Fail closed on external data, corrupt/dirty images and unknown incompatible features.
+        if int.from_bytes(header[72:80], "big") & ~0x18:
+            sys.exit("Unsupported QCOW2 incompatible features (including external data files)")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.set_defaults(func=None)
@@ -84,6 +110,8 @@ def main():
 
     parser_prepare = subparsers.add_parser("prepare", help="Prepare base image")
     parser_prepare.add_argument("-i", "--image", type=Path, metavar="FILE", help="Image filename", required=True)
+    parser_prepare.add_argument("--sha256", required=True, type=sha256_digest, metavar="HEX",
+                                help="Image SHA-256 from an authenticated, trusted source")
     parser_prepare.add_argument("-b", "--base", type=logical_name, help="The base to prepare", default="base")
     parser_prepare.add_argument("-m", "--memory", type=int, metavar="MiB", help="Memory in MiB", default=1024)
     parser_prepare.add_argument("-d", "--disk", type=int, metavar="MiB", help="Disk in MiB", default=8192)
@@ -129,7 +157,7 @@ def prepare(args):
     memory_mib = args.memory
     disk_mib = args.disk
     packages = args.packages
-    prepare_or_update(base_image, base, memory_mib, disk_mib, packages)
+    prepare_or_update(base_image, base, memory_mib, disk_mib, packages, args.sha256)
 
 
 def update(args):
@@ -139,7 +167,7 @@ def update(args):
 
 
 def prepare_or_update(base_image: Path | None, base: str, memory_mib: int, disk_mib: int | None,
-                      packages: list[str]) -> None:
+                      packages: list[str], expected_sha256: str | None = None) -> None:
     name = base
     vm_uuid = str(uuid.uuid4())
 
@@ -148,13 +176,20 @@ def prepare_or_update(base_image: Path | None, base: str, memory_mib: int, disk_
 
     if base_image:
         try:
-            with base_path.open("xb") as destination, base_image.open("rb") as source:
-                shutil.copyfileobj(source, destination)
+            with base_image.open("rb") as source, base_path.open("xb") as destination:
+                try:
+                    shutil.copyfileobj(source, destination)
+                    destination.flush()
+                    validate_import(base_path, expected_sha256)
+                except BaseException:
+                    base_path.unlink()
+                    raise
         except FileExistsError:
             sys.exit(f"Base {base} already exists, choose another base name")
         subprocess.run([
             "qemu-img",
             "resize",
+            "-f", "qcow2",
             "-q",
             str(base_path),
             f"{disk_mib}M"

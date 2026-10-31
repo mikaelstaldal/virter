@@ -10,11 +10,34 @@ sudo apt install python3 qemu-system-x86 qemu-utils genisoimage virtiofsd
 
 ## Prepare image automatically
 
-Fetch https://cloud-images.ubuntu.com/resolute/current/resolute-server-cloudimg-amd64.img
+Only trusted, authenticated, standalone QCOW2 images are supported. A checksum computed from an untrusted image
+is not authentication. Virter does not provide a sandboxed importer for arbitrary images; image metadata is parsed
+by host QEMU tools. Backing files and external data files are refused before QEMU is invoked.
+
+For Ubuntu, download the image and signed checksum manifest from
+[Ubuntu Cloud Images](https://cloud-images.ubuntu.com/resolute/current/).
+Install the Ubuntu cloud image signing keyring from the authenticated Ubuntu package archive:
 
 ```bash
-./virter prepare -i $BASE_IMAGE
+sudo apt install ubuntu-cloudimage-keyring curl
+BASE_IMAGE=resolute-server-cloudimg-amd64.img
+IMAGE_URL=https://cloud-images.ubuntu.com/resolute/current
+curl --fail --remote-name "$IMAGE_URL/$BASE_IMAGE"
+curl --fail --remote-name "$IMAGE_URL/SHA256SUMS"
+curl --fail --remote-name "$IMAGE_URL/SHA256SUMS.gpg"
+gpgv --keyring /usr/share/keyrings/ubuntu-cloudimage-keyring.gpg SHA256SUMS.gpg SHA256SUMS
 ```
+
+Continue only if signature verification succeeds. Extract the exact image's checksum from the verified manifest
+and pass it to virter, which checks the copied bytes before opening the image with QEMU:
+
+```bash
+IMAGE_SHA256=$(awk -v image="$BASE_IMAGE" '$2 == image || $2 == "*" image {print $1}' SHA256SUMS)
+./virter prepare -i "$BASE_IMAGE" --sha256 "$IMAGE_SHA256"
+```
+
+If verification fails, stop and download a matching image and manifest; do not substitute a locally computed checksum.
+Keep the verified manifest unchanged until the digest has been extracted.
 
 Base and instance names (`--base` and `--name`) must contain 1–63 ASCII letters, digits or hyphens,
 starting and ending with a letter or digit. Preparing an existing base is refused; choose a new base name
