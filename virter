@@ -4,6 +4,7 @@ import argparse
 import getpass
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -57,6 +58,25 @@ class NetworkMode(StrEnum):
     NONE = auto()
 
 
+def logical_name(value: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", value):
+        raise argparse.ArgumentTypeError(
+            "names must be 1-63 ASCII letters, digits or hyphens, starting and ending with a letter or digit")
+    return value
+
+
+def base_image_path(cache_dir: Path, base: str) -> Path:
+    path = cache_dir / f"{base}.img"
+    if path.is_symlink() or not path.resolve().is_relative_to(cache_dir.resolve()):
+        sys.exit(f"Unsafe base image path: {path}")
+    return path
+
+
+def qemu_value(value: Path) -> str:
+    # QemuOpts uses doubled commas for a literal comma inside a value.
+    return str(value).replace(",", ",,")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.set_defaults(func=None)
@@ -64,20 +84,20 @@ def main():
 
     parser_prepare = subparsers.add_parser("prepare", help="Prepare base image")
     parser_prepare.add_argument("-i", "--image", type=Path, metavar="FILE", help="Image filename", required=True)
-    parser_prepare.add_argument("-b", "--base", help="The base to prepare", default="base")
+    parser_prepare.add_argument("-b", "--base", type=logical_name, help="The base to prepare", default="base")
     parser_prepare.add_argument("-m", "--memory", type=int, metavar="MiB", help="Memory in MiB", default=1024)
     parser_prepare.add_argument("-d", "--disk", type=int, metavar="MiB", help="Disk in MiB", default=8192)
     parser_prepare.add_argument("-p", "--packages", nargs='+', metavar="PKG", help="Packages to install", default=[])
     parser_prepare.set_defaults(func=prepare)
 
     parser_update = subparsers.add_parser("update", help="Update base image")
-    parser_update.add_argument("-b", "--base", help="The base to update", default="base")
+    parser_update.add_argument("-b", "--base", type=logical_name, help="The base to update", default="base")
     parser_update.add_argument("-m", "--memory", type=int, metavar="MiB", help="Memory in MiB", default=1024)
     parser_update.set_defaults(func=update)
 
     parser_run = subparsers.add_parser("run", help="Run an instance")
-    parser_run.add_argument("-n", "--name", help="Name of the instance", default=f"instance-{int(time.time())}")
-    parser_run.add_argument("-b", "--base", help="The base to use", default="base")
+    parser_run.add_argument("-n", "--name", type=logical_name, help="Name of the instance", default=f"instance-{int(time.time())}")
+    parser_run.add_argument("-b", "--base", type=logical_name, help="The base to use", default="base")
     parser_run.add_argument("-m", "--memory", type=int, metavar="MiB", help="Memory in MiB", default=1024)
     parser_run.add_argument("--network", choices=["host", "none"], default="host", help="Network mode")
     parser_run.add_argument("-w", "--workdir", metavar="DIR", help="Change to this directory inside the VM")
@@ -124,10 +144,14 @@ def prepare_or_update(base_image: Path | None, base: str, memory_mib: int, disk_
     vm_uuid = str(uuid.uuid4())
 
     cache_dir = prepare_cache_dir()
-    base_path = cache_dir / f"{base}.img"
+    base_path = base_image_path(cache_dir, base)
 
     if base_image:
-        shutil.copy(base_image, base_path)
+        try:
+            with base_path.open("xb") as destination, base_image.open("rb") as source:
+                shutil.copyfileobj(source, destination)
+        except FileExistsError:
+            sys.exit(f"Base {base} already exists, choose another base name")
         subprocess.run([
             "qemu-img",
             "resize",
@@ -149,9 +173,6 @@ def prepare_or_update(base_image: Path | None, base: str, memory_mib: int, disk_
         run_vm(name, vm_uuid, base_path, temp_dir, memory_mib, NetworkMode.HOST,
                base_image is not None, mounts=[], ephemeral=False)
     finally:
-        pid_path = cache_dir / f"{name}.pid"
-        if pid_path.exists():
-            pid_path.unlink()
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
@@ -183,17 +204,13 @@ def run(args):
     vm_uuid = str(uuid.uuid4())
 
     cache_dir = prepare_cache_dir()
-    base_path = cache_dir / f"{base}.img"
+    base_path = base_image_path(cache_dir, base)
 
     if not base_path.is_file():
         sys.exit(f"Base {base} not found")
 
-    # The instance image is deleted on exit, so it must not reuse the name of an existing image
-    img_path = cache_dir / f"{name}.img"
-    if img_path.exists():
-        sys.exit(f"Image {img_path} already exists, choose another name")
-
-    temp_dir = Path(tempfile.mkdtemp())
+    temp_dir = Path(tempfile.mkdtemp(dir=cache_dir))
+    img_path = temp_dir / "disk.img"
     try:
         subprocess.run([
             "qemu-img",
@@ -239,11 +256,6 @@ def run(args):
         run_vm(name, vm_uuid, img_path, temp_dir, memory_mib, network, is_prepare=False,
                mounts=mounts, ephemeral=True)
     finally:
-        if img_path.exists():
-            img_path.unlink()
-        pid_path = cache_dir / f"{name}.pid"
-        if pid_path.exists():
-            pid_path.unlink()
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
@@ -338,7 +350,7 @@ cloud-name: virter
         "genisoimage",
         "-quiet",
         "-output",
-        f"{name}-seed.img",
+        "seed.img",
         "-volid",
         "cidata",
         "-rational-rock",
@@ -354,7 +366,7 @@ def prepare_cache_dir() -> Path:
     cache_home = os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))
     cache_dir = Path(cache_home) / "virter"
     cache_dir.mkdir(parents=True, exist_ok=True)
-    return cache_dir
+    return cache_dir.resolve()
 
 
 def wait_for_socket(process: subprocess.Popen, socket_path: Path, timeout_seconds: float = 5):
@@ -369,8 +381,7 @@ def wait_for_socket(process: subprocess.Popen, socket_path: Path, timeout_second
 
 def run_vm(name: str, vm_uuid: str, image: Path, temp_dir: Path, memory_mib: int, network: NetworkMode,
            is_prepare: bool, mounts: list[tuple[Path, bool]], ephemeral: bool):
-    cache_dir = prepare_cache_dir()
-    cloud_init_image = temp_dir / f"{name}-seed.img"
+    cloud_init_image = temp_dir / "seed.img"
 
     network_params = []
     match network:
@@ -390,7 +401,7 @@ def run_vm(name: str, vm_uuid: str, image: Path, temp_dir: Path, memory_mib: int
             virtiofsds.append(virtiofsd)
             wait_for_socket(virtiofsd, virtiofs_socket)
             virtiofs_params += [
-                "-chardev", f"socket,id=char{i},path={virtiofs_socket}",
+                "-chardev", f"socket,id=char{i},path={qemu_value(virtiofs_socket)}",
                 "-device", f"vhost-user-fs-pci,queue-size=1024,chardev=char{i},tag=virtiofs{i}",
             ]
 
@@ -399,15 +410,14 @@ def run_vm(name: str, vm_uuid: str, image: Path, temp_dir: Path, memory_mib: int
                 "qemu-system-x86_64",
                 "-name", name,
                 "-uuid", vm_uuid,
-                "-pidfile", str(cache_dir / f"{name}.pid"),
                 "-cpu", "host",
                 "-accel", "kvm",
                 "-smp", "4",
                 "-m", f"{memory_mib}M",
                 # Writes to an ephemeral image are discarded on exit, so there is no need to wait for flushes
-                "-drive", f"file={image},if=virtio,index=0,format=qcow2,media=disk"
+                "-drive", f"file={qemu_value(image)},if=virtio,index=0,format=qcow2,media=disk"
                           + (",cache=unsafe" if ephemeral else ""),
-                "-drive", f"file={cloud_init_image},index=1,media=cdrom",
+                "-drive", f"file={qemu_value(cloud_init_image)},index=1,media=cdrom",
                 "-sandbox", "on",
                 "-nographic",
                 "-qmp", "null",

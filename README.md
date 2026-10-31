@@ -16,6 +16,10 @@ Fetch https://cloud-images.ubuntu.com/resolute/current/resolute-server-cloudimg-
 ./virter prepare -i $BASE_IMAGE
 ```
 
+Base and instance names (`--base` and `--name`) must contain 1–63 ASCII letters, digits or hyphens,
+starting and ending with a letter or digit. Preparing an existing base is refused; choose a new base name
+or use `update` to modify it. Base images must not be symlinks.
+
 ## Update an image interactively
 
 ```bash
@@ -65,6 +69,14 @@ options. Each directory appears at the same path inside the instance as on the h
 ./virter run --mount DIR1 --mount DIR2 --mount-writable DIR3 --current-dir-writable
 ```
     
+## Testing
+
+Run the automated tests with Python 3; external commands are mocked and no VM is started.
+
+```bash
+./verify.sh
+```
+
 ## License
 
 Copyright 2026 Mikael Ståldal.

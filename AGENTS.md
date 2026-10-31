@@ -17,8 +17,9 @@
 - Avoid running QEMU commands in CI-style steps unless explicitly requested.
 
 ## Running and testing
-- There are no automated tests.
-- For functional verification, run the script with `./virter --help` and, if requested, the relevant subcommand (`prepare`, `update`, `run`).
+- Run automated tests with `./verify.sh`; external commands are mocked and no VM is started.
+- For functional verification, run `./virter --help` and, if requested, the relevant subcommand
+  (`prepare`, `update`, `run`).
 - Do not execute VM runs without user approval because they are heavy and interactive.
 
 ## Code changes
