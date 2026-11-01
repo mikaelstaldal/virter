@@ -50,7 +50,8 @@ class NameSafetyTests(unittest.TestCase):
             command.assert_not_called()
 
     def test_qemu_paths_escape_commas_and_omit_pidfile(self):
-        with patch("subprocess.run") as command:
+        with patch("subprocess.Popen") as command:
+            command.return_value.wait.return_value = 0
             v["run_vm"]("safe", "uuid", Path("/cache,a/disk.img"), Path("/tmp,b"),
                         1024, v["NetworkMode"].HOST, False, [], True)
         arguments = command.call_args.args[0]

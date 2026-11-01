@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+from contextlib import contextmanager
 import getpass
 import hashlib
 import json
@@ -8,6 +9,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -221,7 +223,8 @@ def prepare_or_update(base_image: Path | None, base: str, memory_mib: int, disk_
         run_vm(name, vm_uuid, base_path, temp_dir, memory_mib, NetworkMode.HOST,
                base_image is not None, mounts=[], ephemeral=False)
     finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
+        if not isinstance(sys.exception(), ChildCleanupError):
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 def collect_mounts(args) -> list[tuple[Path, bool]]:
@@ -314,7 +317,8 @@ def run(args):
         run_vm(name, vm_uuid, img_path, temp_dir, memory_mib, network, is_prepare=False,
                mounts=mounts, ephemeral=True, backing_image=base_path)
     finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
+        if not isinstance(sys.exception(), ChildCleanupError):
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 def cloud_init_prepare(name: str, temp_dir: Path, packages: list[str]):
@@ -464,6 +468,70 @@ def qemu_confinement(image: Path, temp_dir: Path, network: NetworkMode,
     return command + ["--"]
 
 
+class ChildCleanupError(RuntimeError):
+    pass
+
+
+@contextmanager
+def vm_children():
+    children = []
+    signals = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+
+    starting = False
+    pending_signal = None
+
+    def interrupted(signum, frame):
+        nonlocal pending_signal
+        if starting:
+            pending_signal = signum
+        else:
+            raise SystemExit(128 + signum)
+
+    previous = {sig: signal.signal(sig, interrupted) for sig in signals}
+
+    def start(command):
+        nonlocal starting
+        # Defer cancellation until the child is registered for cleanup.
+        starting = True
+        try:
+            child = subprocess.Popen(command)
+            children.append(child)
+        finally:
+            starting = False
+            if pending_signal is not None:
+                raise SystemExit(128 + pending_signal)
+        return child
+
+    try:
+        yield start
+    finally:
+        # A second cancellation must not interrupt reaping or resource cleanup.
+        for sig in signals:
+            signal.signal(sig, signal.SIG_IGN)
+        try:
+            errors = []
+            for child in reversed(children):
+                try:
+                    if child.poll() is None:
+                        child.terminate()
+                except OSError as error:
+                    errors.append(error)
+            for child in reversed(children):
+                try:
+                    try:
+                        child.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        child.kill()
+                        child.wait(timeout=5)
+                except (OSError, subprocess.TimeoutExpired) as error:
+                    errors.append(error)
+            if errors:
+                raise ChildCleanupError("Child cleanup failed; retaining VM files") from errors[0]
+        finally:
+            for sig, handler in previous.items():
+                signal.signal(sig, handler)
+
+
 def run_vm(name: str, vm_uuid: str, image: Path, temp_dir: Path, memory_mib: int, network: NetworkMode,
            is_prepare: bool, mounts: list[tuple[Path, bool]], ephemeral: bool,
            backing_image: Path | None = None):
@@ -476,22 +544,20 @@ def run_vm(name: str, vm_uuid: str, image: Path, temp_dir: Path, memory_mib: int
         case NetworkMode.NONE:
             network_params = ["-nic", "none"]
 
-    virtiofsds = []
     virtiofs_params = []
-    try:
+    with vm_children() as start:
         for i, (mount_dir, mount_readonly) in enumerate(mounts):
             virtiofs_socket = temp_dir / f"vhostqemu{i}"
-            virtiofsd = subprocess.Popen(
+            virtiofsd = start(
                 ["/usr/libexec/virtiofsd", "--log-level", "off", "--socket-path", virtiofs_socket, "--shared-dir",
                  mount_dir] + (["--readonly"] if mount_readonly else []))
-            virtiofsds.append(virtiofsd)
             wait_for_socket(virtiofsd, virtiofs_socket)
             virtiofs_params += [
                 "-chardev", f"socket,id=char{i},path={qemu_value(virtiofs_socket)}",
                 "-device", f"vhost-user-fs-pci,queue-size=1024,chardev=char{i},tag=virtiofs{i}",
             ]
 
-        subprocess.run(
+        command = (
             qemu_confinement(image, temp_dir, network, backing_image) + [
                 "/usr/bin/qemu-system-x86_64",
                 "-name", name,
@@ -522,17 +588,18 @@ def run_vm(name: str, vm_uuid: str, image: Path, temp_dir: Path, memory_mib: int
                  "-object",
                  f"memory-backend-file,id=mem,size={memory_mib}M,mem-path=/dev/shm,share=on",
                  "-numa", "node,memdev=mem",
-             ] if mounts else []),
-            check=True
+             ] if mounts else [])
         )
-    finally:
-        for virtiofsd in virtiofsds:
-            virtiofsd.terminate()
-            virtiofsd.wait()
-        # The guest can power off in the middle of an escape sequence, then the terminal would swallow what follows
-        if sys.stdout.isatty():
-            sys.stdout.write("\x1b\\")
-            sys.stdout.flush()
+        try:
+            qemu = start(command)
+            returncode = qemu.wait()
+            if returncode:
+                raise subprocess.CalledProcessError(returncode, command)
+        finally:
+            # A guest can power off in an escape sequence, swallowing subsequent terminal output.
+            if sys.stdout.isatty():
+                sys.stdout.write("\x1b\\")
+                sys.stdout.flush()
 
 
 if __name__ == "__main__":

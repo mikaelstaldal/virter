@@ -37,7 +37,8 @@ class ConfinementTests(unittest.TestCase):
         self.assertIn("confinement preflight failed: denied", stderr.getvalue())
 
     def test_ephemeral_launch_exposes_only_selected_images(self):
-        with patch("subprocess.run") as command:
+        with patch("subprocess.Popen") as command:
+            command.return_value.wait.return_value = 0
             v["run_vm"]("safe", "uuid", Path("/cache/instance/disk.img"), Path("/cache/instance"),
                         1024, v["NetworkMode"].NONE, False, [], True, Path("/cache/base.img"))
         args = command.call_args.args[0]
@@ -54,11 +55,13 @@ class ConfinementTests(unittest.TestCase):
         self.assertEqual(args[index - 1:index + 2], ["--ro-bind", "/cache/base.img", "/cache/base.img"])
         self.assertIn("on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny", args)
         self.assertEqual(args[args.index("--") + 1], "/usr/bin/qemu-system-x86_64")
-        self.assertTrue(command.call_args.kwargs["check"])
+        command.return_value.wait.assert_any_call()
 
     def test_mount_uses_socket_without_exposing_shared_directory_to_qemu(self):
-        with patch("subprocess.run") as command, patch("subprocess.Popen") as daemon, \
+        with patch("subprocess.Popen") as command, \
                 patch.dict(v["run_vm"].__globals__, wait_for_socket=lambda *args: None):
+            command.return_value.wait.return_value = 0
+            command.return_value.poll.return_value = None
             v["run_vm"]("safe", "uuid", Path("/cache/instance/disk.img"), Path("/cache/instance"),
                         1024, v["NetworkMode"].NONE, False, [(Path("/home/user/shared"), True)], True,
                         Path("/cache/base.img"))
@@ -66,9 +69,9 @@ class ConfinementTests(unittest.TestCase):
         self.assertNotIn("/home/user/shared", args)
         self.assertIn("socket,id=char0,path=/cache/instance/vhostqemu0", args)
         self.assertIn("memory-backend-file,id=mem,size=1024M,mem-path=/dev/shm,share=on", args)
-        self.assertIn("--readonly", daemon.call_args.args[0])
-        daemon.return_value.terminate.assert_called_once()
-        daemon.return_value.wait.assert_called_once()
+        self.assertIn("--readonly", command.call_args_list[0].args[0])
+        command.return_value.terminate.assert_called()
+        command.return_value.wait.assert_any_call(timeout=5)
 
     def test_update_exposes_writable_base_and_host_dns(self):
         args = v["qemu_confinement"](Path("/cache/base.img"), Path("/tmp/instance"),
@@ -79,7 +82,7 @@ class ConfinementTests(unittest.TestCase):
         self.assertIn("/etc/resolv.conf", args)
 
     def test_sandbox_failure_does_not_retry_unconfined(self):
-        with patch("subprocess.run", side_effect=subprocess.CalledProcessError(1, "bwrap")) as command, \
+        with patch("subprocess.Popen", side_effect=subprocess.CalledProcessError(1, "bwrap")) as command, \
                 self.assertRaises(subprocess.CalledProcessError):
             v["run_vm"]("safe", "uuid", Path("/cache/base.img"), Path("/tmp/instance"),
                         1024, v["NetworkMode"].NONE, False, [], False)
