@@ -10,6 +10,11 @@ v = runpy.run_path(str(Path(__file__).resolve().parents[1] / 'virter'))
 
 
 class LifecycleTests(unittest.TestCase):
+    def setUp(self):
+        patcher = patch.dict(v["run_vm"].__globals__, relay_output=lambda stream: None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_shutdown_escalates_and_reaps_all_children(self):
         first, second = Mock(), Mock()
         first.poll.return_value = second.poll.return_value = None
@@ -84,7 +89,7 @@ class LifecycleTests(unittest.TestCase):
                                     (v['prepare_or_update'], (None, 'base', 1024, None, []))):
             with self.subTest(function=function.__name__), \
                     patch.dict(function.__globals__, prepare_cache_dir=lambda: Path('/cache'),
-                               generate_cloud_init=Mock(), cloud_init_update=Mock(),
+                               generate_cloud_init=Mock(), cloud_init_update=Mock(), validate_disk_size=Mock(),
                                run_vm=Mock(side_effect=v['ChildCleanupError']('unreaped'))), \
                     patch('pathlib.Path.is_file', return_value=True), \
                     patch('tempfile.mkdtemp', return_value='/cache/temporary'), \

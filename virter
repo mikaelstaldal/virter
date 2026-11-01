@@ -3,10 +3,12 @@
 import argparse
 from contextlib import contextmanager
 import getpass
+import fcntl
 import hashlib
 import json
 import os
 import re
+import resource
 import shlex
 import shutil
 import signal
@@ -105,8 +107,102 @@ def validate_import(image: Path, expected_sha256: str | None) -> None:
             sys.exit("Unsupported QCOW2 incompatible features (including external data files)")
 
 
+# Limits apply to the launcher and every descendant, including virtiofsd.
+VM_CPUS = 4
+MAX_FILE_BYTES = 20 * 1024 ** 3
+MAX_OUTPUT_BYTES = 16 * 1024 ** 2
+
+
+def validate_disk_size(image: Path):
+    if image.stat().st_size > MAX_FILE_BYTES:
+        sys.exit("Image exceeds the 20 GiB host file-size limit")
+    with image.open("rb") as source:
+        header = source.read(32)
+    if header[:4] == b"QFI\xfb" and int.from_bytes(header[24:32], "big") > 16384 * 1024 ** 2:
+        sys.exit("Image exceeds the 16384 MiB virtual disk limit; use a smaller trusted base")
+
+
+def bounded_integer(minimum: int, maximum: int):
+    def parse(value):
+        try:
+            number = int(value)
+        except ValueError:
+            raise argparse.ArgumentTypeError("expected an integer") from None
+        if not minimum <= number <= maximum:
+            raise argparse.ArgumentTypeError(f"must be between {minimum} and {maximum}")
+        return number
+    return parse
+
+
+def supervise(args):
+    unit = f"virter-{uuid.uuid4()}.scope"
+    command = [
+        "systemd-run", "--user", "--scope", "--quiet", "--collect", "--expand-environment=no",
+        f"--unit={unit}", f"--property=CPUQuota={VM_CPUS * 100}%", f"--property=MemoryMax={args.memory + 1024}M",
+        "--property=MemorySwapMax=0", "--property=TasksMax=128",
+        f"--property=RuntimeMaxSec={args.timeout}", "--property=TimeoutStopSec=15s",
+        "--property=KillMode=control-group", "--property=OOMPolicy=kill", "--",
+        sys.executable, str(Path(__file__).resolve()), f"--_supervised={unit}", *sys.argv[1:],
+    ]
+    # exec preserves the terminal and exit status; scope startup failure has no fallback.
+    os.execvp(command[0], command)
+
+
+@contextmanager
+def resource_limits(args):
+    membership = Path("/proc/self/cgroup").read_text().strip()
+    if not membership.startswith("0::/") or Path(membership[3:]).name != args._supervised:
+        sys.exit("Resource supervision requires the assigned cgroup v2 scope")
+    group = Path("/sys/fs/cgroup") / membership[4:]
+    try:
+        memory = int((group / "memory.max").read_text())
+        swap = int((group / "memory.swap.max").read_text())
+        tasks = int((group / "pids.max").read_text())
+        quota, period = map(int, (group / "cpu.max").read_text().split())
+        if memory > (args.memory + 1024) * 1024 ** 2 or swap != 0 or tasks > 128 or quota > VM_CPUS * period:
+            raise ValueError("limits exceed policy")
+    except (OSError, ValueError) as error:
+        sys.exit(f"Required cgroup resource limits are unavailable: {error}")
+
+    # A fixed per-user runtime directory prevents changing XDG_CACHE_HOME from bypassing the limit.
+    directory = Path(f"/run/user/{os.getuid()}")
+    if directory.stat().st_uid != os.getuid() or directory.stat().st_mode & 0o077:
+        sys.exit("A private systemd user runtime directory is required")
+    locks = []
+    try:
+        for slot in range(2):
+            fd = os.open(directory / f"virter-{slot}.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                os.close(fd)
+                continue
+            locks.append(fd)
+            break
+        else:
+            sys.exit("At most two virter invocations may run concurrently per user")
+        resource.setrlimit(resource.RLIMIT_FSIZE, (MAX_FILE_BYTES, MAX_FILE_BYTES))
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+        yield
+    finally:
+        for fd in locks:
+            os.close(fd)
+
+
+def relay_output(stream):
+    sys.stdout.flush()
+    remaining = MAX_OUTPUT_BYTES
+    while chunk := stream.read1(min(65536, remaining + 1)):
+        if len(chunk) > remaining:
+            sys.exit("VM output limit exceeded (16 MiB)")
+        sys.stdout.buffer.write(chunk)
+        sys.stdout.buffer.flush()
+        remaining -= len(chunk)
+
+
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--_supervised", help=argparse.SUPPRESS)
     parser.set_defaults(func=None)
     subparsers = parser.add_subparsers()
 
@@ -115,20 +211,20 @@ def main():
     parser_prepare.add_argument("--sha256", required=True, type=sha256_digest, metavar="HEX",
                                 help="Image SHA-256 from an authenticated, trusted source")
     parser_prepare.add_argument("-b", "--base", type=logical_name, help="The base to prepare", default="base")
-    parser_prepare.add_argument("-m", "--memory", type=int, metavar="MiB", help="Memory in MiB", default=1024)
-    parser_prepare.add_argument("-d", "--disk", type=int, metavar="MiB", help="Disk in MiB", default=8192)
+    parser_prepare.add_argument("-m", "--memory", type=bounded_integer(128, 8192), metavar="MiB", help="Memory in MiB (128-8192)", default=1024)
+    parser_prepare.add_argument("-d", "--disk", type=bounded_integer(1024, 16384), metavar="MiB", help="Disk in MiB (1024-16384)", default=8192)
     parser_prepare.add_argument("-p", "--packages", nargs='+', metavar="PKG", help="Packages to install", default=[])
     parser_prepare.set_defaults(func=prepare)
 
     parser_update = subparsers.add_parser("update", help="Update base image")
     parser_update.add_argument("-b", "--base", type=logical_name, help="The base to update", default="base")
-    parser_update.add_argument("-m", "--memory", type=int, metavar="MiB", help="Memory in MiB", default=1024)
+    parser_update.add_argument("-m", "--memory", type=bounded_integer(128, 8192), metavar="MiB", help="Memory in MiB (128-8192)", default=1024)
     parser_update.set_defaults(func=update)
 
     parser_run = subparsers.add_parser("run", help="Run an instance")
     parser_run.add_argument("-n", "--name", type=logical_name, help="Name of the instance", default=f"instance-{int(time.time())}")
     parser_run.add_argument("-b", "--base", type=logical_name, help="The base to use", default="base")
-    parser_run.add_argument("-m", "--memory", type=int, metavar="MiB", help="Memory in MiB", default=1024)
+    parser_run.add_argument("-m", "--memory", type=bounded_integer(128, 8192), metavar="MiB", help="Memory in MiB (128-8192)", default=1024)
     parser_run.add_argument("--network", choices=["host", "none"], default="none",
                             help="Network mode (default: none); host enables unrestricted QEMU user-mode NAT "
                                  "with access to host services, LAN and internet")
@@ -146,22 +242,30 @@ def main():
     parser_run.add_argument("ARG", nargs="*", help="Arguments to command")
     parser_run.set_defaults(func=run)
 
+    for subparser in (parser_prepare, parser_update, parser_run):
+        subparser.add_argument("--timeout", type=bounded_integer(1, 86400), default=3600, metavar="SECONDS",
+                               help="Maximum runtime in seconds (1-86400, default: 3600)")
+
     args = parser.parse_args()
     if args.func:
         if os.getuid() == 0 or os.geteuid() == 0:
             parser.error("virter must run as an unprivileged user; do not use sudo")
         if shutil.which("bwrap") is None:
             parser.error("Bubblewrap (bwrap) is required for QEMU confinement")
-        try:
-            with tempfile.TemporaryDirectory() as directory:
-                temporary = Path(directory)
-                subprocess.run(qemu_confinement(temporary / "disk.img", temporary, NetworkMode.NONE, None)
-                               + ["/usr/bin/true"], check=True, stdout=subprocess.DEVNULL,
-                               stderr=subprocess.PIPE, text=True)
-        except (OSError, subprocess.CalledProcessError) as error:
-            detail = error.stderr if isinstance(error, subprocess.CalledProcessError) else str(error)
-            parser.error(f"QEMU confinement preflight failed: {detail}")
-        args.func(args)
+        if not args._supervised:
+            supervise(args)
+            return
+        with resource_limits(args):
+            try:
+                with tempfile.TemporaryDirectory() as directory:
+                    temporary = Path(directory)
+                    subprocess.run(qemu_confinement(temporary / "disk.img", temporary, NetworkMode.NONE, None)
+                                   + ["/usr/bin/true"], check=True, stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.PIPE, text=True)
+            except (OSError, subprocess.CalledProcessError) as error:
+                detail = error.stderr if isinstance(error, subprocess.CalledProcessError) else str(error)
+                parser.error(f"QEMU confinement preflight failed: {detail}")
+            args.func(args)
     else:
         parser.print_help()
 
@@ -192,6 +296,7 @@ def prepare_or_update(base_image: Path | None, base: str, memory_mib: int, disk_
     base_path = base_image_path(cache_dir, base)
 
     if base_image:
+        validate_disk_size(base_image)
         try:
             with base_image.open("rb") as source, base_path.open("xb") as destination:
                 try:
@@ -214,6 +319,7 @@ def prepare_or_update(base_image: Path | None, base: str, memory_mib: int, disk_
     else:
         if not base_path.is_file():
             sys.exit(f"Base {base} not found")
+        validate_disk_size(base_path)
 
     temp_dir = Path(tempfile.mkdtemp())
     try:
@@ -271,6 +377,7 @@ def run(args):
 
     if not base_path.is_file():
         sys.exit(f"Base {base} not found")
+    validate_disk_size(base_path)
 
     temp_dir = Path(tempfile.mkdtemp(dir=cache_dir))
     img_path = temp_dir / "disk.img"
@@ -535,12 +642,12 @@ def vm_children():
 
     previous = {sig: signal.signal(sig, interrupted) for sig in signals}
 
-    def start(command):
+    def start(command, **kwargs):
         nonlocal starting
         # Defer cancellation until the child is registered for cleanup.
         starting = True
         try:
-            child = subprocess.Popen(command)
+            child = subprocess.Popen(command, **kwargs)
             children.append(child)
         finally:
             starting = False
@@ -596,7 +703,8 @@ def run_vm(name: str, vm_uuid: str, image: Path, temp_dir: Path, memory_mib: int
             virtiofs_socket = temp_dir / f"vhostqemu{i}"
             virtiofsd = start(
                 ["/usr/libexec/virtiofsd", "--log-level", "off", "--socket-path", virtiofs_socket, "--shared-dir",
-                 mount_dir] + (["--readonly"] if mount_readonly else []))
+                 mount_dir] + (["--readonly"] if mount_readonly else []),
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             wait_for_socket(virtiofsd, virtiofs_socket)
             virtiofs_params += [
                 "-chardev", f"socket,id=char{i},path={qemu_value(virtiofs_socket)}",
@@ -610,10 +718,10 @@ def run_vm(name: str, vm_uuid: str, image: Path, temp_dir: Path, memory_mib: int
                 "-uuid", vm_uuid,
                 "-cpu", "host",
                 "-accel", "kvm",
-                "-smp", "4",
+                "-smp", str(VM_CPUS),
                 "-m", f"{memory_mib}M",
                 # Writes to an ephemeral image are discarded on exit, so there is no need to wait for flushes
-                "-drive", f"file={qemu_value(image)},if=virtio,index=0,format=qcow2,media=disk"
+                "-drive", f"file={qemu_value(image)},if=virtio,index=0,format=qcow2,media=disk,bps=268435456,iops=16384"
                           + (",cache=unsafe" if ephemeral else ""),
                 "-drive", f"file={qemu_value(cloud_init_image)},index=1,media=cdrom",
                 "-sandbox", "on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny",
@@ -637,7 +745,11 @@ def run_vm(name: str, vm_uuid: str, image: Path, temp_dir: Path, memory_mib: int
              ] if mounts else [])
         )
         try:
-            qemu = start(command)
+            qemu = start(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            try:
+                relay_output(qemu.stdout)
+            finally:
+                qemu.stdout.close()
             returncode = qemu.wait()
             if returncode:
                 raise subprocess.CalledProcessError(returncode, command)

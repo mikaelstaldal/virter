@@ -35,6 +35,34 @@ because a writable parent export would bypass a read-only child export.
 A shared directory deliberately grants the guest access to its contents according to the requested mount mode.
 Confinement is defense in depth and does not protect against host kernel vulnerabilities.
 
+## Resource limits
+
+A running systemd user manager and cgroup v2 CPU, memory and PID controllers are required.
+Every invocation runs in a transient user scope covering the launcher, QEMU, virtiofsd and image tools.
+Scope startup or missing controller limits aborts the launch, without a fallback.
+The scope retains the invoking environment, working directory and terminal.
+
+Each invocation is limited to 400% CPU (four host cores, matching the four guest vCPUs),
+requested guest RAM plus 1024 MiB of host overhead, zero swap, and 128 tasks.
+Memory must be 128–8192 MiB; prepared virtual disks must be 1024–16384 MiB.
+Imported and existing images exceeding 16384 MiB virtual size or 20 GiB host file size are refused.
+At most two invocations can run concurrently per host user, across cache directories.
+The default wall-clock limit is one hour, including setup; all subcommands accept `--timeout SECONDS`
+from 1 to 86400. The entire scope is terminated on timeout, with forced termination after 15 seconds.
+Interrupted preparation or updates can leave an incomplete base image; inspect it before reuse.
+
+Guest disk I/O is throttled to 256 MiB/s and 16384 operations/s in QEMU.
+Every descendant has a hard 20 GiB individual file-size limit and cannot produce core dumps.
+VM console output (including QEMU diagnostics) is limited to 16 MiB; exceeding the limit stops the VM.
+Virtiofsd output is discarded. Output copied before termination remains untrusted terminal input.
+
+These are not aggregate filesystem quotas: writable exports can create many files or exhaust inodes,
+and image files still compete with other host data for free space. Use host filesystem space and inode
+quotas for the cache and every writable export when running untrusted workloads. A disposable directory
+alone does not provide a quota. Shared-directory I/O bypasses the QEMU disk throttle.
+Host networking has no bandwidth quota; keep `--network none` for untrusted workloads or enforce limits
+externally. Virter does not configure host filesystem quotas or network traffic control.
+
 ## Prepare image automatically
 
 Only trusted, authenticated, standalone QCOW2 images are supported. A checksum computed from an untrusted image
@@ -114,7 +142,7 @@ the guest shell even when they cannot be used as a system timezone.
 ./virter run -- ls -A /
 ```
 
-Both stdout and stderr from the instance will end up in stdout from the virter command.
+Both stdout and stderr from the instance, plus QEMU diagnostics, end up in stdout from the virter command.
 
 ### With a directory on the host mounted writable
 

@@ -12,6 +12,11 @@ v = runpy.run_path(str(Path(__file__).resolve().parents[1] / "virter"))
 
 
 class NameSafetyTests(unittest.TestCase):
+    def setUp(self):
+        patcher = patch.dict(v["run_vm"].__globals__, relay_output=lambda stream: None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_names(self):
         for name in ("base", "instance-123", "A", "a" * 63):
             self.assertEqual(v["logical_name"](name), name)
@@ -55,8 +60,9 @@ class NameSafetyTests(unittest.TestCase):
             v["run_vm"]("safe", "uuid", Path("/cache,a/disk.img"), Path("/tmp,b"),
                         1024, v["NetworkMode"].HOST, False, [], True)
         arguments = command.call_args.args[0]
+        self.assertEqual(arguments[arguments.index("-smp") + 1], str(v["VM_CPUS"]))
         self.assertNotIn("-pidfile", arguments)
-        self.assertIn("file=/cache,,a/disk.img,if=virtio,index=0,format=qcow2,media=disk,cache=unsafe", arguments)
+        self.assertIn("file=/cache,,a/disk.img,if=virtio,index=0,format=qcow2,media=disk,bps=268435456,iops=16384,cache=unsafe", arguments)
         self.assertIn("file=/tmp,,b/seed.img,index=1,media=cdrom", arguments)
 
     def test_run_isolates_image_and_preserves_name_derived_files(self):

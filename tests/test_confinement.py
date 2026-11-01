@@ -12,6 +12,11 @@ v = runpy.run_path(str(Path(__file__).resolve().parents[1] / "virter"))
 
 
 class ConfinementTests(unittest.TestCase):
+    def setUp(self):
+        patcher = patch.dict(v["run_vm"].__globals__, relay_output=lambda stream: None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_cli_network_selection_controls_guest_and_qemu_network(self):
         for options, expected in (([], "none"), (["--network", "none"], "none"),
                                   (["--network", "host"], "user,hostname=safe,model=virtio-net-pci")):
@@ -20,12 +25,13 @@ class ConfinementTests(unittest.TestCase):
                     patch("os.geteuid", return_value=1000), \
                     patch("shutil.which", return_value="/usr/bin/bwrap"), \
                     patch("subprocess.run"), patch("subprocess.Popen") as command, \
-                    patch("sys.argv", ["virter", "run", "--name", "safe", *options]):
+                    patch("sys.argv", ["virter", "--_supervised=test.scope", "run", "--name", "safe", *options]):
                 cache = Path(directory)
                 (cache / "base.img").touch()
                 command.return_value.wait.return_value = 0
                 with patch.dict(v["main"].__globals__, prepare_cache_dir=lambda: cache,
-                                generate_cloud_init=lambda *a, **k: None):
+                                generate_cloud_init=lambda *a, **k: None,
+                                resource_limits=lambda args: contextlib.nullcontext()):
                     v["main"]()
                 args = command.call_args.args[0]
                 self.assertEqual(args[args.index("-nic") + 1], expected)
@@ -49,8 +55,10 @@ class ConfinementTests(unittest.TestCase):
         with patch("os.getuid", return_value=1000), patch("os.geteuid", return_value=1000), \
                 patch("shutil.which", return_value="/usr/bin/bwrap"), \
                 patch("subprocess.run", side_effect=subprocess.CalledProcessError(1, "bwrap", stderr="denied")), \
-                patch.dict(v["main"].__globals__, run=lambda args: self.fail("run must not be called")), \
-                patch("sys.argv", ["virter", "run"]), contextlib.redirect_stderr(io.StringIO()) as stderr, \
+                patch.dict(v["main"].__globals__, run=lambda args: self.fail("run must not be called"),
+                           resource_limits=lambda args: contextlib.nullcontext()), \
+                patch("sys.argv", ["virter", "--_supervised=test.scope", "run"]), \
+                contextlib.redirect_stderr(io.StringIO()) as stderr, \
                 self.assertRaises(SystemExit) as error:
             v["main"]()
         self.assertEqual(error.exception.code, 2)
