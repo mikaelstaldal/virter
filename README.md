@@ -26,6 +26,8 @@ The host QEMU process cannot create additional user namespaces inside its Bubble
 This does not restrict user namespaces or containers inside the VM, which runs its own kernel.
 
 Directory sharing uses a separate virtiofsd process running as the invoking user, outside this QEMU sandbox.
+Mounts of your home directory or any ancestor (such as `/` or `/home`) are refused in both read-only and
+writable mode, including with `--current-dir` and `--current-dir-writable`. Symlink aliases are resolved first.
 Overlapping shared directories must use the same access mode; mixing read-only and writable exports is rejected
 because a writable parent export would bypass a read-only child export.
 
@@ -77,7 +79,8 @@ Any changes to the file system will be persisted.
 
 ## Run an ephemeral instance
 
-Any changes to the file system will be discarded when the instance exits.
+Changes to the instance disk are discarded when the instance exits. Writes to writable host shares persist
+on the host, including when the VM fails; deleting the instance disk does not undo them.
 
 ### With an interactive shell
 
@@ -95,10 +98,34 @@ Both stdout and stderr from the instance will end up in stdout from the virter c
 
 ### With a directory on the host mounted writable
 
+`--mount-writable` and `--current-dir-writable` give the guest persistent write authority over the shared
+host directory. A guest can alter source code, executables, build configuration or shell startup files that
+later execute on the host. QEMU confinement does not prevent these authorized writes through virtiofsd.
+Writable mounts overlapping the virter cache (normally `$XDG_CACHE_HOME/virter`,
+or `~/.cache/virter`) are also refused, protecting base images and other instances. Paths are resolved before
+these checks, including symlink aliases. Other directories inside your home can still be shared writable;
+avoid sharing credentials or an active checkout.
+
 ```bash
 ./virter run --mount-writable DIR
 ./virter run --current-dir-writable
 ```
+
+For untrusted guest work, prefer read-only inputs and a dedicated, disposable staging directory for output.
+If the guest needs to modify inputs, copy only the required files into staging first. For example:
+Run this from the input directory, with the temporary directory location outside that directory so the
+read-only input and writable staging exports do not overlap. Set `TMPDIR` to a separate location if needed.
+
+```bash
+staging=$(mktemp -d)
+./virter run --mount "$PWD" --mount-writable "$staging"
+```
+
+The staging directory appears at the same absolute path inside the guest. After the VM exits, treat everything
+in it as untrusted: inspect changes and check file types and symlink targets before manually copying selected
+results to a separate destination. Do not execute generated scripts, source configuration, or run builds from
+staging as part of review. There is no automatic result export or trust validation. Remove staging manually
+when finished; its contents persist until you do.
 
 ### With a directory on the host mounted read-only
 

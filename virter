@@ -132,12 +132,12 @@ def main():
     parser_run.add_argument("--mount", type=Path, metavar="DIR", action="append", default=[],
                             help="Mount a directory in VM read-only, can be repeated")
     parser_run.add_argument("--mount-writable", type=Path, metavar="DIR", action="append", default=[],
-                            help="Mount a directory in VM writable, can be repeated")
+                            help="Mount a host directory writable; host changes persist after exit, can be repeated")
     current_dir_mounts = parser_run.add_mutually_exclusive_group()
     current_dir_mounts.add_argument("--current-dir", action='store_true',
                                     help="Mount the current directory in VM read-only")
     current_dir_mounts.add_argument("--current-dir-writable", action='store_true',
-                                    help="Mount the current directory in VM writable")
+                                    help="Mount the current host directory writable; host changes persist after exit")
     parser_run.add_argument("COMMAND", nargs="?", help="Command to run")
     parser_run.add_argument("ARG", nargs="*", help="Arguments to command")
     parser_run.set_defaults(func=run)
@@ -229,11 +229,17 @@ def collect_mounts(args) -> list[tuple[Path, bool]]:
     if args.current_dir or args.current_dir_writable:
         requested.append((Path("."), args.current_dir))
 
+    home = Path.home().resolve()
+    cache = cache_directory().resolve()
     mounts = {}
     for path, readonly in requested:
         mount_dir = path.resolve()
         if not mount_dir.is_dir():
             sys.exit(f"Directory {mount_dir} not found")
+        if home.is_relative_to(mount_dir):
+            sys.exit(f"Refusing mount {mount_dir}: exposes the home directory")
+        if not readonly and (cache.is_relative_to(mount_dir) or mount_dir.is_relative_to(cache)):
+            sys.exit(f"Refusing writable mount {mount_dir}: exposes the virter cache")
         if mount_dir in mounts:
             sys.exit(f"Directory {mount_dir} specified more than once")
         for other_dir, other_readonly in mounts.items():
@@ -414,9 +420,12 @@ cloud-name: virter
     ], cwd=(str(temp_dir)), check=True)
 
 
+def cache_directory() -> Path:
+    return Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))) / "virter"
+
+
 def prepare_cache_dir() -> Path:
-    cache_home = os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))
-    cache_dir = Path(cache_home) / "virter"
+    cache_dir = cache_directory()
     cache_dir.mkdir(parents=True, exist_ok=True)
     return cache_dir.resolve()
 
