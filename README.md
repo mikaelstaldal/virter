@@ -95,6 +95,13 @@ services via the guest-visible host address (normally `10.0.2.2`). NAT does not 
 boundary. Virter does not offer an internet-only mode or filter private, link-local, IPv4 or IPv6 destinations;
 use offline mode for untrusted guests. Image preparation and updates also use this unrestricted networking.
 
+The guest inherits the invoking user's `LANG`, `LANGUAGE`, and nonempty `LC_*` locale settings on each
+`prepare`, `update`, and `run`. Requested locales are generated only during `prepare` and `update`,
+so run `update` with new locale settings before using them with `run`. When `LANG` is unset, `C.UTF-8` is used.
+Language translations depend on the packages installed in the image.
+The timezone follows `TZ` when set, otherwise the host system timezone. POSIX `TZ` rules are passed to
+the guest shell even when they cannot be used as a system timezone.
+
 ### With an interactive shell
 
 ```bash

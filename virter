@@ -326,12 +326,10 @@ def run(args):
 def cloud_init_prepare(name: str, temp_dir: Path, packages: list[str]):
     username = getpass.getuser()
     cols, rows = shutil.get_terminal_size()
-    timezone = read_timezone()
-    timezone_data = f"timezone: {timezone}\n" if timezone else ""
     generate_cloud_init(
         name,
         temp_dir,
-        f"""{CLOUD_CONFIG_HEADER}{timezone_data}user:
+        f"""{CLOUD_CONFIG_HEADER}user:
   name: \"{username}\"
   uid: \"{os.getuid()}\"
   groups: [adm, cdrom, dip, lxd, sudo]
@@ -358,18 +356,19 @@ write_files:
     GRUB_CMDLINE_LINUX_DEFAULT="quiet console=ttyS0 systemd.getty_auto=no"
     GRUB_TERMINAL=console      
 runcmd:
- - DEBIAN_FRONTEND=noninteractive apt-get purge -y openssh-server
- - systemctl mask {" ".join(UNNEEDED_UNITS)}
- - systemctl disable getty@tty1.service
- - systemctl disable serial-getty@ttyS0.service
- - systemctl enable serial-getty@ttyS1.service
- - update-grub 
+- DEBIAN_FRONTEND=noninteractive apt-get purge -y openssh-server
+- systemctl mask {" ".join(UNNEEDED_UNITS)}
+- systemctl disable getty@tty1.service
+- systemctl disable serial-getty@ttyS0.service
+- systemctl enable serial-getty@ttyS1.service
+- update-grub
 power_state:
   delay: now
   mode: poweroff
   timeout: 10
   condition: true
-"""
+""",
+        generate_locales=True
     )
 
 
@@ -377,11 +376,55 @@ def cloud_init_update(name, temp_dir: Path):
     generate_cloud_init(
         name,
         temp_dir,
-        CLOUD_CONFIG_HEADER + "users: []\n"
+        CLOUD_CONFIG_HEADER + "users: []\n",
+        generate_locales=True
     )
 
 
+LOCALE_VARIABLES = (
+    "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "LC_NUMERIC", "LC_TIME", "LC_COLLATE",
+    "LC_MONETARY", "LC_MESSAGES", "LC_PAPER", "LC_NAME", "LC_ADDRESS",
+    "LC_TELEPHONE", "LC_MEASUREMENT", "LC_IDENTIFICATION",
+)
+
+
+def guest_localization(vendor_data: str, generate_locales: bool = False) -> str:
+    environment = {key: os.environ[key] for key in LOCALE_VARIABLES if os.environ.get(key)}
+    environment.setdefault("LANG", "C.UTF-8")
+    timezone = read_timezone()
+    if timezone:
+        vendor_data += f"timezone: {json.dumps(timezone)}\n"
+    # TZ also accepts POSIX rules, which cloud-init's timezone setting cannot represent.
+    if "TZ" in os.environ:
+        environment["TZ"] = os.environ["TZ"]
+    profile = "".join(f"export {key}={shlex.quote(value)}\n" for key, value in environment.items())
+    file_data = ("- path: /etc/profile.d/virter-locale.sh\n  content: |\n"
+                 + "".join(f"    {line}\n" for line in profile.splitlines()))
+    if re.search(r"^write_files:\n", vendor_data, re.MULTILINE):
+        vendor_data = re.sub(r"^write_files:\n", lambda _: "write_files:\n" + file_data,
+                             vendor_data, count=1, flags=re.MULTILINE)
+    else:
+        vendor_data += "write_files:\n" + file_data
+    locales = sorted({value for key, value in environment.items()
+                      if key not in ("LANGUAGE", "TZ") and value not in ("C", "POSIX", "C.UTF-8", "C.utf8")})
+    if generate_locales and locales:
+        command = "- " + json.dumps(["locale-gen", *locales]) + "\n"
+        # Generate locales before the getty can start a login shell.
+        if re.search(r"^bootcmd:\n", vendor_data, re.MULTILINE):
+            vendor_data = re.sub(r"^bootcmd:\n", lambda _: "bootcmd:\n" + command,
+                                 vendor_data, count=1, flags=re.MULTILINE)
+        else:
+            vendor_data += "bootcmd:\n" + command
+    return vendor_data
+
+
 def read_timezone():
+    override = os.environ.get("TZ", "").removeprefix(":")
+    if override:
+        zone = override.removeprefix("/usr/share/zoneinfo/")
+        if not Path(zone).is_absolute() and ".." not in Path(zone).parts:
+            if (Path("/usr/share/zoneinfo") / zone).is_file():
+                return zone
     # /etc/localtime is a symlink like ../usr/share/zoneinfo/Europe/Stockholm
     try:
         target = os.readlink("/etc/localtime")
@@ -396,16 +439,17 @@ def read_timezone():
         return ""
 
 
-def generate_cloud_init(name: str, temp_dir: Path, vendor_data: str):
+def generate_cloud_init(name: str, temp_dir: Path, vendor_data: str, generate_locales: bool = False):
+    # Reused base and instance names must still apply this invocation's cloud-config.
     (temp_dir / "meta-data").write_text(f"""#cloud-config
-instance-id: {name}
+instance-id: {name}-{uuid.uuid4()}
 local-hostname: {name}
 cloud-name: virter
 """, encoding="utf-8")
     (temp_dir / "network-config").write_text("""#cloud-config
 {}
 """, encoding="utf-8")
-    (temp_dir / "vendor-data").write_text(vendor_data, encoding="utf-8")
+    (temp_dir / "vendor-data").write_text(guest_localization(vendor_data, generate_locales), encoding="utf-8")
     (temp_dir / "user-data").write_text("""#cloud-config
 {}
 """, encoding="utf-8")
