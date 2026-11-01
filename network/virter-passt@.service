@@ -1,0 +1,17 @@
+[Unit]
+Description=virter passt network backend for one VM
+
+[Service]
+User=virter-passt
+# Runs as root. On failure passt does not start and the connection closes.
+ExecStartPre=+/usr/sbin/nft -f /usr/local/share/virter/virter-bridge.nft
+# Accept=yes passes the connection as fd 3. Passt silently exits if given fd 0, so StandardInput=socket cannot be used.
+ExecStart=/usr/bin/passt --foreground --one-off --fd 3 \
+    --map-host-loopback none --map-guest-addr none --no-map-gw \
+    --dns 1.1.1.1 --dns-forward 1.1.1.1 --dns-forward 2606:4700:4700::1111 \
+    --dns-host 1.1.1.1 --dns-host 2606:4700:4700::1111 \
+    --no-dhcp-search --tcp-ports none --udp-ports none
+MemoryMax=512M
+MemorySwapMax=0
+TasksMax=32
+CPUQuota=200%

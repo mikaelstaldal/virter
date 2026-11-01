@@ -1,0 +1,984 @@
+#!/usr/bin/env python3
+"""Integration checks for `virter run --network bridge`; see NETWORKING.md.
+
+Host commands start VMs and never change host configuration: when a check needs an administrator
+change, the commands are printed for the operator to run in another terminal.
+"""
+
+import argparse
+import json
+import os
+import shutil
+import signal
+import socket
+import ssl
+import stat
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.request
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+SCRIPT = Path(__file__).resolve()
+NFT_FILE = "/usr/local/share/virter/virter-bridge.nft"
+BRIDGE_SOCKET = "/run/virter-passt.sock"
+BOOT_TIMEOUT = 300
+PROBE_TIMEOUT = 3
+PROBE_WORKERS = 64
+SLIRP_ADDRESSES = ["10.0.2.2", "10.0.2.3"]
+LOOPBACK_ADDRESSES = ["127.0.0.1", "127.0.0.2", "::1"]
+RELOCATED_V4, RELOCATED_V4_GATEWAY = "198.18.0.2/24", "198.18.0.1"
+RELOCATED_V6 = "2001:db8:ffff::2/64"
+
+NO_EGRESS = "not tested: without guest egress the probes would pass without ever reaching passt"
+
+terminating = False
+
+
+# Probing, used on the host and in the guest
+
+def family_of(address):
+    return socket.AF_INET6 if ":" in address else socket.AF_INET
+
+
+def probe(proto, address, port, token, timeout=PROBE_TIMEOUT):
+    """Return "echoed" if a test listener answered the token, "connected" for any other peer, else "blocked"."""
+    kind = socket.SOCK_STREAM if proto == "tcp" else socket.SOCK_DGRAM
+    connected = False
+    try:
+        info = socket.getaddrinfo(address, port, family_of(address), kind)[0]
+        with socket.socket(info[0], kind) as sock:
+            sock.settimeout(timeout)
+            sock.connect(info[4])
+            connected = proto == "tcp"
+            sock.sendall(f"{token}\n".encode())
+            reply = sock.recv(256)
+    except OSError:
+        return "connected" if connected else "blocked"
+    return "echoed" if reply.startswith(token.encode()) else "connected"
+
+
+def probe_all(targets, ports, token, timeout=PROBE_TIMEOUT):
+    jobs = [(proto, target, port) for target in targets for proto, port in ports]
+    with ThreadPoolExecutor(PROBE_WORKERS) as pool:
+        outcomes = pool.map(lambda job: probe(*job, token, timeout), jobs)
+        return [{"proto": job[0], "address": job[1], "port": job[2], "outcome": outcome}
+                for job, outcome in zip(jobs, outcomes)]
+
+
+class Listeners:
+    """TCP and UDP token echo listeners. A hit is recorded only for a token belonging to this run."""
+
+    def __init__(self, tokens=None):
+        self.tokens = tokens if tokens is not None else set()
+        self.endpoints = []
+        self.hits = []
+        self.lock = threading.Lock()
+        self.sockets = []
+        self.dns_missing = []
+
+    def add(self, proto, address, port=0, scope_id=0):
+        family = family_of(address)
+        sock = socket.socket(family, socket.SOCK_STREAM if proto == "tcp" else socket.SOCK_DGRAM)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if family == socket.AF_INET6:
+                sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+                sock.bind((address, port, 0, scope_id))
+            else:
+                sock.bind((address, port))
+            if proto == "tcp":
+                sock.listen(64)
+        except OSError:
+            sock.close()
+            raise
+        endpoint = {"proto": proto, "bind": address, "port": sock.getsockname()[1]}
+        self.endpoints.append(endpoint)
+        self.sockets.append(sock)
+        run = self.serve_tcp if proto == "tcp" else self.serve_udp
+        threading.Thread(target=run, args=(sock, endpoint), daemon=True).start()
+        return endpoint
+
+    def answer(self, data, endpoint, peer):
+        text = data.decode(errors="replace").strip()
+        if text not in self.tokens:
+            return None
+        with self.lock:
+            self.hits.append({**endpoint, "token": text, "peer": str(peer[0])})
+        return f"{text} {endpoint['proto']} {endpoint['bind']}\n".encode()
+
+    def serve_tcp(self, sock, endpoint):
+        while True:
+            try:
+                connection, peer = sock.accept()
+            except OSError:
+                return
+            threading.Thread(target=self.handle_tcp, args=(connection, peer, endpoint), daemon=True).start()
+
+    def handle_tcp(self, connection, peer, endpoint):
+        with connection:
+            try:
+                connection.settimeout(PROBE_TIMEOUT)
+                if reply := self.answer(connection.recv(256), endpoint, peer):
+                    connection.sendall(reply)
+            except OSError:
+                pass
+
+    def serve_udp(self, sock, endpoint):
+        while True:
+            try:
+                data, peer = sock.recvfrom(256)
+                if reply := self.answer(data, endpoint, peer):
+                    sock.sendto(reply, peer)
+            except OSError:
+                return
+
+    def ports(self):
+        return [[endpoint["proto"], endpoint["port"]] for endpoint in self.endpoints]
+
+    def hits_for(self, token):
+        with self.lock:
+            return [hit for hit in self.hits if hit["token"] == token]
+
+    def close(self):
+        for sock in self.sockets:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            sock.close()
+
+
+# Guest side
+
+def command_output(*command):
+    try:
+        return subprocess.run(command, capture_output=True, text=True, timeout=30).stdout
+    except (OSError, subprocess.SubprocessError) as error:
+        return str(error)
+
+
+def ip_json(*args):
+    result = subprocess.run(["ip", "-j", *args], capture_output=True, text=True, timeout=30)
+    if result.returncode:
+        raise RuntimeError(f"ip {' '.join(args)}: {result.stderr.strip()}")
+    return json.loads(result.stdout or "[]")
+
+
+def guest_facts():
+    return {
+        "addresses": ip_json("address"), "routes": ip_json("route"), "routes6": ip_json("-6", "route"),
+        "resolvectl": command_output("resolvectl", "status"),
+    }
+
+
+def uplink():
+    addresses = [link for link in ip_json("address") if link.get("ifname") != "lo"]
+    return addresses[0]["ifname"] if addresses else None
+
+
+def guest_targets(targets):
+    """Add the guest's own view: its gateways and assigned addresses, and scope link-local addresses."""
+    facts = guest_facts()
+    found = list(targets)
+    for route in facts["routes"] + facts["routes6"]:
+        if route.get("gateway"):
+            found.append(route["gateway"])
+    for link in facts["addresses"]:
+        if link.get("ifname") != "lo":
+            found += [info["local"] for info in link.get("addr_info", []) if "local" in info]
+    interface = uplink()
+    scoped = []
+    for target in dict.fromkeys(found):
+        if target.lower().startswith("fe80:") and "%" not in target:
+            if interface is None:
+                continue
+            target = f"{target}%{interface}"
+        scoped.append(target)
+    return scoped
+
+
+def relocate():
+    """Move the guest off the host-derived address that passt assigned it.
+
+    Passt gives the guest the host's own address, so probes to that address otherwise stay inside the guest.
+    A malicious guest can drop that address to send the same packets to passt, so this path must be tested.
+    """
+    if subprocess.run(["systemd-detect-virt", "--vm", "--quiet"]).returncode != 0:
+        return {"ok": False, "error": "not running in a VM"}
+    interface = uplink()
+    if interface is None:
+        return {"ok": False, "error": "no network interface"}
+    commands = [
+        ["ip", "-4", "address", "flush", "dev", interface],
+        ["ip", "-6", "address", "flush", "dev", interface, "scope", "global"],
+        ["ip", "address", "add", RELOCATED_V4, "dev", interface],
+        ["ip", "route", "replace", "default", "via", RELOCATED_V4_GATEWAY, "dev", interface],
+        ["ip", "address", "add", RELOCATED_V6, "dev", interface],
+    ]
+    errors = []
+    for command in commands:
+        result = subprocess.run(["sudo", "-n", *command], capture_output=True, text=True)
+        if result.returncode:
+            errors.append(f"{' '.join(command)}: {result.stderr.strip()}")
+    return {"ok": not errors, "error": "; ".join(errors), "facts": guest_facts()}
+
+
+def flush_dns():
+    # A lookup from before the network went away would otherwise still succeed from the resolver's cache.
+    if subprocess.run(["systemd-detect-virt", "--vm", "--quiet"]).returncode != 0:
+        raise RuntimeError("not running in a VM")
+    subprocess.run(["sudo", "-n", "resolvectl", "flush-caches"], check=True, capture_output=True, timeout=30)
+
+
+def https_fetch(url):
+    try:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(url, timeout=10) as response:
+            return {"ok": True, "status": response.status}
+    except (OSError, ssl.SSLError, ValueError) as error:
+        return {"ok": False, "error": str(error)}
+
+
+def resolve(name):
+    try:
+        return {"ok": True, "addresses": sorted({info[4][0] for info in socket.getaddrinfo(name, 443)})}
+    except OSError as error:
+        return {"ok": False, "error": str(error)}
+
+
+def ping(address):
+    try:
+        result = subprocess.run(["ping", "-c", "1", "-W", "3", address], capture_output=True, timeout=10)
+        return {"ok": result.returncode == 0}
+    except (OSError, subprocess.SubprocessError) as error:
+        return {"ok": False, "error": str(error)}
+
+
+def perform(action):
+    match action["type"]:
+        case "facts":
+            return guest_facts()
+        case "probes":
+            targets = guest_targets(action["targets"]) if action.get("guest_targets") else action["targets"]
+            results = probe_all(targets, action["ports"], action["token"], action.get("timeout", PROBE_TIMEOUT))
+            return {"targets": targets, "count": len(results),
+                    "reached": [result for result in results if result["outcome"] != "blocked"]}
+        case "relocate":
+            return relocate()
+        case "https":
+            return https_fetch(action["url"])
+        case "resolve":
+            if action.get("flush"):
+                flush_dns()
+            return resolve(action["name"])
+        case "ping":
+            return ping(action["address"])
+        case "wait_network":
+            deadline = time.monotonic() + action["seconds"]
+            while time.monotonic() < deadline and not ip_json("route", "show", "default"):
+                time.sleep(1)
+            return {"ok": bool(ip_json("route", "show", "default"))}
+    return {"error": f"unknown action {action['type']}"}
+
+
+def perform_safely(action):
+    try:
+        return perform(action)
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+        return {"guest_error": f"{action['type']}: {error}"}
+
+
+def write_json(path, value):
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(value))
+    temporary.rename(path)
+
+
+def guest_main(args):
+    directory = Path(args.directory)
+    write_json(directory / "ready.json", {"ok": True})
+    step = 1
+    while not (directory / "stop").exists():
+        plan = directory / f"plan-{step}.json"
+        if plan.exists():
+            results = [perform_safely(action) for action in json.loads(plan.read_text())]
+            write_json(directory / f"result-{step}.json", results)
+            step += 1
+        else:
+            time.sleep(0.25)
+
+
+# Host side
+
+class Report:
+    def __init__(self, path):
+        self.path = path
+        self.entries = []
+
+    def add(self, status, check, detail=""):
+        print(f"[{status}] {check}" + (f": {detail}" if detail else ""), flush=True)
+        self.entries.append({"status": status, "check": check, "detail": detail})
+        self.path.write_text(json.dumps(self.entries, indent=2) + "\n")
+
+    def check(self, passed, check, detail="", hint=""):
+        self.add("PASS" if passed else "FAIL", check, detail or ("" if passed else hint))
+        return passed
+
+    def finish(self):
+        counts = {status: sum(entry["status"] == status for entry in self.entries)
+                  for status in ("PASS", "FAIL", "SKIP", "MANUAL")}
+        print("\n" + ", ".join(f"{count} {status}" for status, count in counts.items()))
+        print(f"Report: {self.path}")
+        return 1 if counts["FAIL"] else 0
+
+
+def terminate_on_signal():
+    def terminated(signum, frame):
+        global terminating
+        terminating = True
+        for sig in (signal.SIGTERM, signal.SIGHUP):
+            signal.signal(sig, signal.SIG_IGN)
+        raise SystemExit(128 + signum)
+
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, terminated)
+
+
+def prompt(message, commands=()):
+    print(f"\n{message}")
+    for command in commands:
+        print(f"    {command}")
+    if terminating:
+        return False
+    try:
+        input("Press Enter when done, or Ctrl-D to skip: ")
+        return True
+    except EOFError:
+        print()
+        return False
+
+
+def ask(question):
+    try:
+        return input(f"{question} [y/N] ").strip().lower() in ("y", "yes")
+    except EOFError:
+        return False
+
+
+def host_addresses():
+    """Every address on the host, excluding the loopback ones covered by LOOPBACK_ADDRESSES unless secondary."""
+    addresses = []
+    for link in json.loads(subprocess.run(["ip", "-j", "address"], capture_output=True, text=True, check=True).stdout):
+        for info in link.get("addr_info", []):
+            if info.get("local") and info["local"] not in ("127.0.0.1", "::1"):
+                addresses.append({"address": info["local"], "dev": link["ifname"], "index": link["ifindex"],
+                                  "scope": info.get("scope")})
+    return addresses
+
+
+def add_dns_listener(listeners, proto, address, scope_id=0):
+    # Port 53 usually needs privileges or is taken by a local resolver; test it when possible.
+    try:
+        listeners.add(proto, address, port=53, scope_id=scope_id)
+    except OSError as error:
+        listeners.dns_missing.append(f"{proto} {address}: {error.strerror}")
+
+
+def report_dns_coverage(listeners, report):
+    if listeners.dns_missing:
+        report.add("MANUAL", "no test listener on port 53 for some addresses, so host DNS is not fully covered; "
+                             "lower net.ipv4.ip_unprivileged_port_start and stop local resolvers to cover it",
+                   "; ".join(listeners.dns_missing))
+        listeners.dns_missing.clear()
+
+
+def bind_address(listeners, report, entry):
+    scope_id = entry["index"] if entry.get("scope") == "link" else 0
+    for proto in ("tcp", "udp"):
+        try:
+            listeners.add(proto, entry["address"], scope_id=scope_id)
+        except OSError as error:
+            report.add("SKIP", f"listen {proto} on {entry['address']} ({entry['dev']})", str(error))
+            continue
+        add_dns_listener(listeners, proto, entry["address"], scope_id)
+
+
+def host_targets(addresses):
+    targets = []
+    for entry in addresses:
+        targets.append(entry["address"])
+        if ":" not in entry["address"]:
+            targets.append(f"::ffff:{entry['address']}")
+    return targets + SLIRP_ADDRESSES + LOOPBACK_ADDRESSES
+
+
+def self_check(listeners, report, addresses, tokens):
+    token = f"self-{uuid.uuid4()}"
+    tokens.add(token)
+    scopes = {entry["address"]: entry["dev"] for entry in addresses if entry.get("scope") == "link"}
+    failed = []
+    for endpoint in listeners.endpoints:
+        bind = endpoint["bind"]
+        target = {"0.0.0.0": "127.0.0.1", "::": "::1"}.get(bind, f"{bind}%{scopes[bind]}" if bind in scopes else bind)
+        if probe(endpoint["proto"], target, endpoint["port"], token) != "echoed":
+            failed.append(f"{endpoint['proto']} {bind}:{endpoint['port']}")
+    report.check(not failed, f"{len(listeners.endpoints)} host listeners work from the host", ", ".join(failed))
+
+
+def resolve_peers(peers, token):
+    """Use literal addresses in the guest, whose public DNS cannot resolve private names."""
+    resolved = []
+    for name, port in peers:
+        try:
+            infos = socket.getaddrinfo(name, port, type=socket.SOCK_STREAM)
+        except OSError as error:
+            sys.exit(f"Cannot resolve --peer {name}: {error}")
+        # Link-local peers are not reachable from the guest through passt.
+        addresses = list(dict.fromkeys(info[4][0] for info in infos if not info[4][0].lower().startswith("fe80:")))
+        if not addresses:
+            sys.exit(f"--peer {name} has no routable address")
+        reachable = [address for address in addresses if probe("tcp", address, port, token) != "blocked"]
+        resolved += [(address, port) for address in reachable or addresses]
+    return resolved
+
+
+def parse_peer(value):
+    address, separator, port = value.rpartition(":")
+    if not separator or not port.isdigit() or "%" in address:
+        raise argparse.ArgumentTypeError("expected ADDRESS:PORT, with IPv6 as [ADDRESS]:PORT")
+    return address.strip("[]"), int(port)
+
+
+class Vm:
+    """A VM running the guest side of this script, driven through a writable shared directory."""
+
+    def __init__(self, args, network, label, run_dir):
+        self.directory = run_dir / label
+        self.directory.mkdir()
+        # The guest user's UID may differ from the invoking user's.
+        self.directory.chmod(0o777)
+        script = self.directory / "verify-bridge"
+        shutil.copy(SCRIPT, script)
+        script.chmod(0o755)
+        self.step = 0
+        self.log = open(run_dir / f"{label}.log", "wb")
+        print(f"Starting VM ({network}), log in {self.log.name}", flush=True)
+        # A pipe rather than /dev/null, so QEMU's stdio console does not see end of input.
+        self.process = subprocess.Popen(
+            [args.virter, "run", "--base", args.base, "--network", network, "--timeout", str(args.vm_timeout),
+             "--mount-writable", str(self.directory), "--", "python3", str(script), "guest", str(self.directory)],
+            stdin=subprocess.PIPE, stdout=self.log, stderr=subprocess.STDOUT)
+
+    def wait_for(self, path, timeout):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if path.exists():
+                return json.loads(path.read_text())
+            if self.process.poll() is not None:
+                raise RuntimeError(f"VM exited with status {self.process.returncode}, see {self.log.name}")
+            time.sleep(0.25)
+        raise RuntimeError(f"timed out waiting for {path.name}, see {self.log.name}")
+
+    def ready(self):
+        self.wait_for(self.directory / "ready.json", BOOT_TIMEOUT)
+
+    def do(self, *actions, timeout=600):
+        self.step += 1
+        write_json(self.directory / f"plan-{self.step}.json", list(actions))
+        results = self.wait_for(self.directory / f"result-{self.step}.json", timeout)
+        for result in results:
+            if "guest_error" in result:
+                raise RuntimeError(f"guest could not perform {result['guest_error']}")
+        return results[0] if len(results) == 1 else results
+
+    def stop(self):
+        (self.directory / "stop").touch()
+        self.finish()
+
+    def finish(self):
+        try:
+            self.process.wait(timeout=120)
+        except subprocess.TimeoutExpired:
+            self.process.terminate()
+            self.process.wait(timeout=30)
+        if self.process.stdin:
+            self.process.stdin.close()
+        self.log.close()
+
+
+def no_backend_remains(report, timeout=10):
+    command = ["systemctl", "list-units", "--plain", "--no-legend", "--state=active,activating", "virter-passt@*"]
+    deadline = time.monotonic() + timeout
+    while True:
+        result = subprocess.run(command, capture_output=True, text=True)
+        if result.returncode:
+            return report.check(False, "no passt instance remains", f"systemctl failed: {result.stderr.strip()}")
+        remaining = result.stdout.strip()
+        if not remaining or time.monotonic() > deadline:
+            return report.check(not remaining, "no passt instance remains", remaining)
+        time.sleep(0.5)
+
+
+def isolation_round(vm, listeners, report, token, label, addresses, guest_view=True):
+    """Probe every listener at every target. Only an answer or a request at a host listener is a breach."""
+    action = {"type": "probes", "targets": host_targets(addresses), "ports": listeners.ports(), "token": token,
+              "guest_targets": guest_view}
+    result = vm.do(action)
+    echoed = [item for item in result["reached"] if item["outcome"] == "echoed"]
+    other = [item for item in result["reached"] if item["outcome"] == "connected"]
+    report.check(not echoed, f"{label}: host listeners unreachable ({result['count']} probes)",
+                 json.dumps(echoed[:20]) if echoed else "")
+    hits = listeners.hits_for(token)
+    report.check(not hits, f"{label}: host listeners received no guest request", json.dumps(hits[:20]) if hits else "")
+    if other:
+        report.add("MANUAL", f"{label}: something other than a test listener answered; confirm it is not on the host",
+                   json.dumps(other[:20]))
+
+
+def egressing_isolation_round(vm, args, listeners, report, token, label, addresses):
+    """Run an isolation round only if probes can reach passt now, as a dead backend would also block everything."""
+    control = vm.do({"type": "probes", "targets": [args.egress_v4[0], args.egress_v6[0]],
+                     "ports": [["tcp", args.egress_v4[1]], ["tcp", args.egress_v6[1]]], "token": "control"})
+    reached = {item["address"] for item in control["reached"]}
+    if not report.check(args.egress_v4[0] in reached, f"{label}: IPv4 egress to {args.egress_v4[0]}", hint=NO_EGRESS):
+        return False
+    if args.egress_v6[0] in reached:
+        report.add("PASS", f"{label}: IPv6 egress to {args.egress_v6[0]}")
+    elif probe("tcp", *args.egress_v6, "control") == "blocked":
+        report.add("SKIP", f"{label}: IPv6 isolation", "no IPv6 egress from the guest or the host, so IPv6 is untested")
+    else:
+        report.check(False, f"{label}: IPv6 egress to {args.egress_v6[0]}",
+                     "the host has it but the guest does not, so IPv6 is untested")
+    isolation_round(vm, listeners, report, token, label, addresses)
+    return True
+
+
+def connectivity(vm, args, report, label, expect):
+    """Check the positive controls; expect=False asserts they all fail."""
+    tag = "works" if expect else "is unavailable"
+    outcomes = {}
+    outcomes["dns"] = vm.do({"type": "resolve", "name": args.dns_name, "flush": not expect})
+    outcomes["https"] = vm.do({"type": "https", "url": args.https_url})
+    report.check(outcomes["dns"]["ok"] == expect, f"{label}: DNS {tag}", outcomes["dns"].get("error", ""))
+    report.check(outcomes["https"]["ok"] == expect, f"{label}: HTTPS {tag}", outcomes["https"].get("error", ""))
+    return outcomes["https"]["ok"]
+
+
+def peers_check(vm, args, report, label):
+    if not args.peer:
+        report.add("SKIP", f"{label}: LAN peer", "no --peer given")
+    for address, port in args.peer:
+        for proto in ("tcp", "udp"):
+            result = vm.do({"type": "probes", "targets": [address], "ports": [[proto, port]], "token": args.peer_token})
+            outcomes = {item["outcome"] for item in result["reached"]}
+            report.check("echoed" in outcomes, f"{label}: {proto} reaches LAN peer {address}:{port}")
+
+
+def must_block_check(vm, args, report, label):
+    for address, port in args.must_block:
+        result = vm.do({"type": "probes", "targets": [address], "ports": [["tcp", port]], "token": "must-block"})
+        report.check(not result["reached"], f"{label}: {address}:{port} is blocked")
+
+
+def check_backend_runs(report):
+    """Call while connected: systemd accepts the connection even if passt then fails to start."""
+    time.sleep(2)
+    result = subprocess.run(["systemctl", "list-units", "--plain", "--no-legend", "--state=running", "virter-passt@*"],
+                            capture_output=True, text=True)
+    report.check(result.returncode == 0 and bool(result.stdout.strip()), "passt keeps running for a connection",
+                 "" if result.stdout.strip() else "check `journalctl -u 'virter-passt@*'` and the kernel log for "
+                                                  "AppArmor denials")
+
+
+def preflight(args, report, addresses):
+    print("Host addresses:")
+    for entry in addresses:
+        print(f"    {entry['address']} ({entry['dev']}, scope {entry['scope']})")
+    if not any(entry["scope"] == "global" for entry in addresses):
+        report.add("MANUAL", "host has no global address; LAN-address isolation is not exercised")
+    for tool in ("ip", "systemctl"):
+        report.check(shutil.which(tool) is not None, f"{tool} is available")
+    report.check(os.access(args.virter, os.X_OK), f"{args.virter} is executable")
+    active = subprocess.run(["systemctl", "is-active", "--quiet", "virter-passt.socket"]).returncode == 0
+    report.check(active, "virter-passt.socket is active")
+    try:
+        status = os.stat(BRIDGE_SOCKET)
+    except OSError as error:
+        report.check(False, f"{BRIDGE_SOCKET} exists", str(error))
+    else:
+        report.check(stat.S_ISSOCK(status.st_mode) and status.st_mode & 0o777 == 0o660,
+                     f"{BRIDGE_SOCKET} is a socket with mode 0660", oct(status.st_mode & 0o777))
+        report.check(status.st_gid in os.getgroups(), "this session is in the socket's group",
+                     "log in again after being added" if status.st_gid not in os.getgroups() else "")
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.settimeout(5)
+        try:
+            client.connect(BRIDGE_SOCKET)
+            report.add("PASS", "bridge socket accepts connections")
+            check_backend_runs(report)
+        except OSError as error:
+            report.check(False, "bridge socket accepts connections", str(error))
+    report.check(https_fetch(args.https_url)["ok"], f"host reaches {args.https_url}")
+    for address, port in args.must_block:
+        report.check(probe("tcp", address, port, "must-block") != "blocked",
+                     f"host reaches --must-block service {address}:{port}, so blocking it means something")
+    for address, port in args.peer:
+        for proto in ("tcp", "udp"):
+            report.check(probe(proto, address, port, args.peer_token) == "echoed",
+                         f"host reaches LAN peer {address}:{port} over {proto}",
+                         hint=f"run `verify-bridge peer --token {args.peer_token}` on the peer")
+
+
+def start_listeners(report, addresses, tokens):
+    listeners = Listeners(tokens)
+    for address in ("127.0.0.1", "::1", "0.0.0.0", "::"):
+        for proto in ("tcp", "udp"):
+            try:
+                listeners.add(proto, address)
+            except OSError as error:
+                report.add("SKIP", f"listen {proto} on {address}", str(error))
+            add_dns_listener(listeners, proto, address)
+    for entry in addresses:
+        bind_address(listeners, report, entry)
+    report_dns_coverage(listeners, report)
+    self_check(listeners, report, addresses, tokens)
+    return listeners
+
+
+def new_token(tokens, label):
+    token = f"{label}-{uuid.uuid4()}"
+    tokens.add(token)
+    return token
+
+
+def check_none(args, run_dir, report, listeners, tokens, addresses):
+    vm = Vm(args, "none", "none", run_dir)
+    try:
+        vm.ready()
+        facts = vm.do({"type": "facts"})
+        nics = [link["ifname"] for link in facts["addresses"] if link.get("ifname") != "lo"]
+        report.check(not nics, "none: guest has no NIC", ", ".join(nics))
+        connectivity(vm, args, report, "none", expect=False)
+        isolation_round(vm, listeners, report, new_token(tokens, "none"), "none", addresses, guest_view=False)
+    finally:
+        vm.stop()
+
+
+def check_host(args, run_dir, report, listeners, tokens):
+    # Shows that a guest can reach these listeners when nothing blocks it, so the bridge results mean something.
+    vm = Vm(args, "host", "host", run_dir)
+    try:
+        vm.ready()
+        vm.do({"type": "wait_network", "seconds": 60})
+        token = new_token(tokens, "host")
+        wanted = [[endpoint["proto"], endpoint["port"]] for endpoint in listeners.endpoints
+                  if endpoint["bind"] in ("127.0.0.1", "0.0.0.0")]
+        result = vm.do({"type": "probes", "targets": ["10.0.2.2"], "ports": wanted, "token": token})
+        echoed = [item for item in result["reached"] if item["outcome"] == "echoed"]
+        report.check(len(echoed) == len(wanted) and listeners.hits_for(token),
+                     "host: guest reaches host listeners through 10.0.2.2 (positive control)",
+                     f"{len(echoed)} of {len(wanted)}")
+    finally:
+        vm.stop()
+
+
+def relocated_round(vm, args, listeners, report, token, addresses, run_dir):
+    moved = vm.do({"type": "relocate"})
+    write_json(run_dir / "bridge-relocated-facts.json", moved)
+    if not report.check(moved["ok"], "bridge: guest moved off its host-derived address", moved.get("error", "")):
+        return
+    if egressing_isolation_round(vm, args, listeners, report, token, "bridge relocated guest address", addresses):
+        must_block_check(vm, args, report, "bridge relocated guest address")
+
+
+def check_bridge(args, run_dir, report, listeners, tokens, addresses):
+    vm = Vm(args, "bridge", "bridge", run_dir)
+    token = new_token(tokens, "bridge")
+    all_addresses = list(addresses)
+    secondary = []
+    try:
+        vm.ready()
+        report.check(vm.do({"type": "wait_network", "seconds": 60})["ok"], "bridge: guest has a default route",
+                     hint="check `journalctl -u 'virter-passt@*'` and the kernel log for AppArmor denials")
+        write_json(run_dir / "bridge-facts.json", vm.do({"type": "facts"}))
+        if not connectivity(vm, args, report, "bridge", expect=True):
+            report.add("SKIP", "bridge isolation", NO_EGRESS)
+            return
+        if vm.do({"type": "ping", "address": "1.1.1.1"})["ok"]:
+            report.add("PASS", "bridge: ping 1.1.1.1")
+        else:
+            report.add("MANUAL", "bridge: ping 1.1.1.1", "may need net.ipv4.ping_group_range to include virter-passt")
+        peers_check(vm, args, report, "bridge")
+        if egressing_isolation_round(vm, args, listeners, report, token, "bridge", all_addresses):
+            must_block_check(vm, args, report, "bridge")
+
+        # Step 5: a new host address needs no policy reload.
+        if not args.no_secondary and prompt(
+                "Step 5: add secondary host addresses while the guest runs, for example:",
+                ["sudo ip address add 192.0.2.77/32 dev lo", "sudo ip address add 2001:db8:77::1/128 dev lo"]):
+            known = {entry["address"] for entry in all_addresses}
+            secondary = [entry for entry in host_addresses() if entry["address"] not in known]
+            if secondary:
+                print("New addresses: " + ", ".join(entry["address"] for entry in secondary))
+                for entry in secondary:
+                    bind_address(listeners, report, entry)
+                report_dns_coverage(listeners, report)
+                all_addresses += secondary
+                self_check(listeners, report, all_addresses, tokens)
+                egressing_isolation_round(vm, args, listeners, report, token, "bridge secondary addresses",
+                                          all_addresses)
+            else:
+                report.add("SKIP", "bridge secondary addresses", "no new host address found")
+        else:
+            report.add("SKIP", "bridge secondary addresses")
+
+        if args.no_relocate:
+            report.add("SKIP", "bridge relocated guest address")
+        else:
+            relocated_round(vm, args, listeners, report, token, all_addresses, run_dir)
+    finally:
+        try:
+            vm.stop()
+        finally:
+            if secondary:
+                prompt("Remove the addresses added for this test, for example:",
+                       ["sudo ip address del 192.0.2.77/32 dev lo", "sudo ip address del 2001:db8:77::1/128 dev lo"])
+    no_backend_remains(report)
+    report.add("MANUAL", "confirm no other firewall, tc or BPF policy changes the reserved mark 0x76527472")
+    report.add("MANUAL", "if containers or VMs run here, confirm direct peers cannot relay to host services")
+
+
+def run_main(args):
+    run_dir = Path(tempfile.mkdtemp(prefix="virter-verify-", dir=args.output_dir))
+    report = Report(run_dir / "report.json")
+    addresses = host_addresses()
+    args.peer_token = args.peer_token or "virter-verify"
+    args.peer = resolve_peers(args.peer, args.peer_token)
+    preflight(args, report, addresses)
+    if any(entry["status"] == "FAIL" for entry in report.entries) and not args.force:
+        print("Preflight failed; not starting VMs. Use --force to continue anyway.")
+        return report.finish()
+    print("\nThis starts three VMs in turn: --network none, host and bridge. The host VM has unrestricted access.")
+    if not args.yes and not ask("Continue?"):
+        return report.finish()
+    tokens = {args.peer_token}
+    listeners = start_listeners(report, addresses, tokens)
+    write_json(run_dir / "listeners.json", listeners.endpoints)
+    try:
+        for name, check in (
+                ("none", lambda: check_none(args, run_dir, report, listeners, tokens, addresses)),
+                ("host", lambda: check_host(args, run_dir, report, listeners, tokens)),
+                ("bridge", lambda: check_bridge(args, run_dir, report, listeners, tokens, addresses))):
+            if name in args.skip:
+                report.add("SKIP", f"{name} VM")
+                continue
+            try:
+                check()
+            except RuntimeError as error:
+                report.check(False, f"{name} VM", str(error))
+    finally:
+        listeners.close()
+    return report.finish()
+
+
+def expect_refused(args, run_dir, report, label):
+    log = run_dir / f"{label}.log"
+    with log.open("wb") as output:
+        process = subprocess.run([args.virter, "run", "--base", args.base, "--network", "bridge", "--timeout", "120",
+                                  "--", "true"], stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT,
+                                 timeout=180)
+    report.check(process.returncode != 0 and "Bridge networking unavailable" in log.read_text(errors="replace"),
+                 f"{label}: bridge run aborts", f"status {process.returncode}, log {log}")
+
+
+def case_socket(args, run_dir, report):
+    try:
+        if prompt("Stop the socket unit:", ["sudo systemctl stop virter-passt.socket"]):
+            expect_refused(args, run_dir, report, "socket-stopped")
+    finally:
+        prompt("Restore it:", ["sudo systemctl start virter-passt.socket"])
+
+
+def case_group(args, run_dir, report):
+    try:
+        if prompt("Take this user out of the socket's access (it must not be in group root):",
+                  [f"sudo chgrp root {BRIDGE_SOCKET}"]):
+            expect_refused(args, run_dir, report, "socket-denied")
+    finally:
+        prompt("Restore it:", [f"sudo chgrp virter-bridge {BRIDGE_SOCKET}"])
+
+
+def case_invalid_policy(args, run_dir, report):
+    try:
+        if prompt("Break the nftables file:",
+                  [f"sudo cp {NFT_FILE} {NFT_FILE}.bak", f"echo invalid | sudo tee -a {NFT_FILE}"]):
+            vm = Vm(args, "bridge", "invalid-policy", run_dir)
+            try:
+                vm.ready()
+                vm.do({"type": "wait_network", "seconds": 30})
+                connectivity(vm, args, report, "invalid policy", expect=False)
+            finally:
+                vm.stop()
+            report.add("MANUAL", "invalid policy: confirm the failure is logged by `journalctl -u 'virter-passt@*'`")
+    finally:
+        prompt("Restore it:", [f"sudo mv {NFT_FILE}.bak {NFT_FILE}"])
+
+
+def case_altered_policy(args, run_dir, report):
+    if not prompt("With no bridge VM running, add a rule that would defeat the early check:",
+                  ['sudo nft insert rule inet virter_bridge preoutput meta skuid "virter-passt" accept']):
+        return
+    try:
+        addresses = host_addresses()
+        tokens = set()
+        listeners = start_listeners(report, addresses, tokens)
+        try:
+            vm = Vm(args, "bridge", "altered-policy", run_dir)
+            try:
+                vm.ready()
+                vm.do({"type": "wait_network", "seconds": 60})
+                egressing_isolation_round(vm, args, listeners, report, new_token(tokens, "altered"), "altered policy",
+                                          addresses)
+            finally:
+                vm.stop()
+        finally:
+            listeners.close()
+        print(f"\nCompare the table with {NFT_FILE}:\n    sudo nft list table inet virter_bridge")
+        report.check(ask("Does it match, with the added rule gone?"), "altered policy: exact table restored")
+    except BaseException:
+        prompt("The check did not finish, so the added rule may remain. Restore the table:",
+               [f"sudo nft -f {NFT_FILE}"])
+        raise
+
+
+def case_backend_killed(args, run_dir, report):
+    vm = Vm(args, "bridge", "backend-killed", run_dir)
+    try:
+        vm.ready()
+        vm.do({"type": "wait_network", "seconds": 60})
+        if not connectivity(vm, args, report, "before killing passt", expect=True):
+            return
+        if prompt("Terminate passt while the VM runs:", ["sudo systemctl kill 'virter-passt@*'"]):
+            connectivity(vm, args, report, "after killing passt", expect=False)
+            result = vm.do({"type": "probes", "targets": SLIRP_ADDRESSES, "ports": [["tcp", 53], ["udp", 53]],
+                            "token": "no-fallback"})
+            report.check(not result["reached"], "after killing passt: no fallback to host networking")
+            report.check(vm.process.poll() is None, "after killing passt: VM keeps running")
+    finally:
+        vm.stop()
+    no_backend_remains(report)
+
+
+def case_cancel(args, run_dir, report):
+    vm = Vm(args, "bridge", "cancelled", run_dir)
+    try:
+        vm.ready()
+        vm.process.send_signal(signal.SIGTERM)
+        vm.finish()
+    finally:
+        if vm.process.poll() is None:
+            vm.process.kill()
+            vm.process.wait()
+    no_backend_remains(report)
+
+
+FAILURE_CASES = {
+    "socket": case_socket,
+    "group": case_group,
+    "invalid-policy": case_invalid_policy,
+    "altered-policy": case_altered_policy,
+    "backend-killed": case_backend_killed,
+    "cancel": case_cancel,
+}
+
+
+def failures_main(args):
+    run_dir = Path(tempfile.mkdtemp(prefix="virter-verify-", dir=args.output_dir))
+    report = Report(run_dir / "report.json")
+    print("Use a disposable host. Each case asks you to change, then restore, the administrator setup.")
+    for name in args.case or FAILURE_CASES:
+        print(f"\n=== {name} ===")
+        try:
+            FAILURE_CASES[name](args, run_dir, report)
+        except (RuntimeError, OSError, subprocess.SubprocessError) as error:
+            report.check(False, name, str(error))
+    return report.finish()
+
+
+def peer_main(args):
+    listeners = Listeners({args.token})
+    for address in ("0.0.0.0", "::"):
+        for proto in ("tcp", "udp"):
+            try:
+                listeners.add(proto, address, port=args.port)
+            except OSError as error:
+                print(f"Not listening on {proto} {address}: {error}")
+    print(f"Echoing token {args.token} on port {args.port}. Press Ctrl-C to stop.", flush=True)
+    try:
+        signal.pause()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        listeners.close()
+    return 0
+
+
+def add_vm_options(parser):
+    parser.add_argument("--virter", default=str(SCRIPT.parents[1] / "virter"), help=argparse.SUPPRESS)
+    parser.add_argument("--base", default="base", help="virter base to use (default: base)")
+    parser.add_argument("--https-url", default="https://www.example.com/", help="HTTPS URL to fetch from the guest")
+    parser.add_argument("--dns-name", default="www.example.com", help="public name to resolve from the guest")
+    parser.add_argument("--egress-v4", type=parse_peer, default=("1.1.1.1", 443), metavar="ADDRESS:PORT",
+                        help="public TCP service proving IPv4 probes reach passt (default: 1.1.1.1:443)")
+    parser.add_argument("--egress-v6", type=parse_peer, default=("2606:4700:4700::1111", 443), metavar="[ADDRESS]:PORT",
+                        help="public TCP service proving IPv6 probes reach passt (default: Cloudflare, port 443)")
+    parser.add_argument("--vm-timeout", type=int, default=1800, help="virter --timeout for each VM")
+    parser.add_argument("--output-dir", help="where to create the results directory (default: system temp directory)")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    commands = parser.add_subparsers(required=True, dest="command")
+
+    run = commands.add_parser("run", help="preflight and steps 1-5 and 7: isolation and connectivity checks")
+    add_vm_options(run)
+    run.add_argument("--peer", type=parse_peer, action="append", default=[], metavar="ADDRESS:PORT",
+                     help="LAN machine running `verify-bridge peer`; repeat for IPv6 as [ADDRESS]:PORT")
+    run.add_argument("--peer-token", help="token given to `verify-bridge peer` (default: virter-verify)")
+    run.add_argument("--must-block", type=parse_peer, action="append", default=[], metavar="ADDRESS:PORT",
+                     help="other TCP service the guest must not reach, such as a host-published container port")
+    run.add_argument("--skip", action="append", default=[], choices=["none", "host", "bridge"], help="skip this VM")
+    run.add_argument("--no-secondary", action="store_true", help="skip the interactive secondary address check")
+    run.add_argument("--no-relocate", action="store_true", help="skip moving the guest off its host-derived address")
+    run.add_argument("--force", action="store_true", help="start VMs even if preflight failed")
+    run.add_argument("-y", "--yes", action="store_true", help="do not ask before starting VMs")
+    run.set_defaults(func=run_main)
+
+    failures = commands.add_parser("failures", help="step 6: guided failure cases, needs an administrator")
+    add_vm_options(failures)
+    failures.add_argument("--case", action="append", choices=list(FAILURE_CASES), help="run only this case")
+    failures.set_defaults(func=failures_main)
+
+    peer = commands.add_parser("peer", help="run on a LAN machine: TCP and UDP token echo service")
+    peer.add_argument("--port", type=int, default=18900)
+    peer.add_argument("--token", default="virter-verify")
+    peer.set_defaults(func=peer_main)
+
+    guest = commands.add_parser("guest", help=argparse.SUPPRESS)
+    guest.add_argument("directory")
+    guest.set_defaults(func=guest_main)
+
+    args = parser.parse_args()
+    if args.command != "guest" and os.geteuid() == 0:
+        parser.error("run this as the user who runs virter, not as root")
+    terminate_on_signal()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

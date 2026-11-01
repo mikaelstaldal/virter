@@ -1,0 +1,17 @@
+# Applied atomically by virter-passt@.service as root before every passt start.
+# Keep this account dedicated to passt. This mark is reserved for virter.
+destroy table inet virter_bridge
+table inet virter_bridge {
+    chain preoutput {
+        type filter hook output priority -450; policy accept;
+        meta skuid "virter-passt" fib daddr type local drop
+    }
+    chain output {
+        type filter hook output priority 300; policy accept;
+        meta skuid "virter-passt" meta mark set 0x76527472
+    }
+    chain input {
+        type filter hook input priority -300; policy accept;
+        meta mark 0x76527472 drop
+    }
+}

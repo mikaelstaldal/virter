@@ -22,6 +22,8 @@ base image read-only; `prepare` and `update` can write their selected base image
 user's home are not exposed. Host networking is retained only with `--network host` (also used for image updates).
 This exposes host loopback services and abstract Unix sockets to QEMU. Runs default to `--network none`,
 which disables the guest NIC and isolates QEMU in a separate network namespace.
+`--network bridge` also isolates QEMU's network namespace and uses a filtered passt backend;
+see [bridge setup and guarantees](NETWORKING.md).
 A non-VM confinement preflight checks namespace creation and KVM device visibility before modifying images.
 The host QEMU process cannot create additional user namespaces inside its Bubblewrap sandbox.
 This does not restrict user namespaces or containers inside the VM, which runs its own kernel.
@@ -120,8 +122,13 @@ Runs are offline by default (`--network none`). To explicitly enable networking:
 Despite its name, `host` uses QEMU user-mode networking (NAT), not a bridged guest interface.
 It permits unrestricted outbound access to the internet, LAN and host services, including host loopback
 services via the guest-visible host address (normally `10.0.2.2`). NAT does not provide an outbound security
-boundary. Virter does not offer an internet-only mode or filter private, link-local, IPv4 or IPv6 destinations;
-use offline mode for untrusted guests. Image preparation and updates also use this unrestricted networking.
+boundary. Image preparation and updates also use this unrestricted networking.
+
+For outbound Internet/LAN access with direct host-service isolation, use `./virter run --network bridge`
+after the mandatory [administrator setup](NETWORKING.md); running it needs no sudo. This uses passt and an
+IPv4/IPv6 host firewall policy that systemd applies before each start, including protection for services bound
+to host LAN addresses. It is not a true Ethernet bridge. LAN peers remain accessible; review the documented
+remote-relay limitations before using it.
 
 The guest inherits the invoking user's `LANG`, `LANGUAGE`, and nonempty `LC_*` locale settings on each
 `prepare`, `update`, and `run`. Requested locales are generated only during `prepare` and `update`,

@@ -1,0 +1,13 @@
+[Unit]
+Description=virter host-isolated passt network backend
+
+[Socket]
+ListenStream=/run/virter-passt.sock
+Accept=yes
+SocketUser=root
+SocketGroup=virter-bridge
+SocketMode=0660
+MaxConnections=16
+
+[Install]
+WantedBy=sockets.target
