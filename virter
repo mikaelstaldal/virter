@@ -129,7 +129,9 @@ def main():
     parser_run.add_argument("-n", "--name", type=logical_name, help="Name of the instance", default=f"instance-{int(time.time())}")
     parser_run.add_argument("-b", "--base", type=logical_name, help="The base to use", default="base")
     parser_run.add_argument("-m", "--memory", type=int, metavar="MiB", help="Memory in MiB", default=1024)
-    parser_run.add_argument("--network", choices=["host", "none"], default="host", help="Network mode")
+    parser_run.add_argument("--network", choices=["host", "none"], default="none",
+                            help="Network mode (default: none); host enables unrestricted QEMU user-mode NAT "
+                                 "with access to host services, LAN and internet")
     parser_run.add_argument("-w", "--workdir", metavar="DIR", help="Change to this directory inside the VM")
     parser_run.add_argument("--mount", type=Path, metavar="DIR", action="append", default=[],
                             help="Mount a directory in VM read-only, can be repeated")

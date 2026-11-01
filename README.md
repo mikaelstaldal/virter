@@ -20,7 +20,8 @@ and explicit seccomp restrictions. Its filesystem contains read-only system runt
 and `/dev/shm`, `/dev/kvm`, the instance directory and the required disk images. Ephemeral instances see their
 base image read-only; `prepare` and `update` can write their selected base image. Other cache images and the
 user's home are not exposed. Host networking is retained only with `--network host` (also used for image updates).
-This exposes host loopback services and abstract Unix sockets to QEMU; use `--network none` for offline runs.
+This exposes host loopback services and abstract Unix sockets to QEMU. Runs default to `--network none`,
+which disables the guest NIC and isolates QEMU in a separate network namespace.
 A non-VM confinement preflight checks namespace creation and KVM device visibility before modifying images.
 The host QEMU process cannot create additional user namespaces inside its Bubblewrap sandbox.
 This does not restrict user namespaces or containers inside the VM, which runs its own kernel.
@@ -81,6 +82,18 @@ Any changes to the file system will be persisted.
 
 Changes to the instance disk are discarded when the instance exits. Writes to writable host shares persist
 on the host, including when the VM fails; deleting the instance disk does not undo them.
+
+Runs are offline by default (`--network none`). To explicitly enable networking:
+
+```bash
+./virter run --network host
+```
+
+Despite its name, `host` uses QEMU user-mode networking (NAT), not a bridged guest interface.
+It permits unrestricted outbound access to the internet, LAN and host services, including host loopback
+services via the guest-visible host address (normally `10.0.2.2`). NAT does not provide an outbound security
+boundary. Virter does not offer an internet-only mode or filter private, link-local, IPv4 or IPv6 destinations;
+use offline mode for untrusted guests. Image preparation and updates also use this unrestricted networking.
 
 ### With an interactive shell
 

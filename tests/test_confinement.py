@@ -3,6 +3,7 @@ import io
 from pathlib import Path
 import runpy
 import subprocess
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -11,6 +12,25 @@ v = runpy.run_path(str(Path(__file__).resolve().parents[1] / "virter"))
 
 
 class ConfinementTests(unittest.TestCase):
+    def test_cli_network_selection_controls_guest_and_qemu_network(self):
+        for options, expected in (([], "none"), (["--network", "none"], "none"),
+                                  (["--network", "host"], "user,hostname=safe,model=virtio-net-pci")):
+            with self.subTest(options=options), tempfile.TemporaryDirectory() as directory, \
+                    patch("os.getuid", return_value=1000), \
+                    patch("os.geteuid", return_value=1000), \
+                    patch("shutil.which", return_value="/usr/bin/bwrap"), \
+                    patch("subprocess.run"), patch("subprocess.Popen") as command, \
+                    patch("sys.argv", ["virter", "run", "--name", "safe", *options]):
+                cache = Path(directory)
+                (cache / "base.img").touch()
+                command.return_value.wait.return_value = 0
+                with patch.dict(v["main"].__globals__, prepare_cache_dir=lambda: cache,
+                                generate_cloud_init=lambda *a, **k: None):
+                    v["main"]()
+                args = command.call_args.args[0]
+                self.assertEqual(args[args.index("-nic") + 1], expected)
+                self.assertEqual("--share-net" in args, expected != "none")
+
     def test_root_and_missing_bubblewrap_refused_before_work(self):
         for uid, euid, bwrap in ((0, 0, "/usr/bin/bwrap"), (1000, 0, "/usr/bin/bwrap"),
                                   (0, 1000, "/usr/bin/bwrap"), (1000, 1000, None)):
