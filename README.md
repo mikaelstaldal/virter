@@ -26,6 +26,9 @@ The host QEMU process cannot create additional user namespaces inside its Bubble
 This does not restrict user namespaces or containers inside the VM, which runs its own kernel.
 
 Directory sharing uses a separate virtiofsd process running as the invoking user, outside this QEMU sandbox.
+Overlapping shared directories must use the same access mode; mixing read-only and writable exports is rejected
+because a writable parent export would bypass a read-only child export.
+
 A shared directory deliberately grants the guest access to its contents according to the requested mount mode.
 Confinement is defense in depth and does not protect against host kernel vulnerabilities.
 

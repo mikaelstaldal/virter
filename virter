@@ -236,6 +236,10 @@ def collect_mounts(args) -> list[tuple[Path, bool]]:
             sys.exit(f"Directory {mount_dir} not found")
         if mount_dir in mounts:
             sys.exit(f"Directory {mount_dir} specified more than once")
+        for other_dir, other_readonly in mounts.items():
+            if readonly != other_readonly and (
+                    mount_dir.is_relative_to(other_dir) or other_dir.is_relative_to(mount_dir)):
+                sys.exit(f"Overlapping directories {mount_dir} and {other_dir} have conflicting mount permissions")
         mounts[mount_dir] = readonly
 
     # A parent must be mounted before its subdirectories, otherwise it would hide them
