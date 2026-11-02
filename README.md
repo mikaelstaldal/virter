@@ -100,13 +100,29 @@ Base and instance names (`--base` and `--name`) must contain 1–63 ASCII letter
 starting and ending with a letter or digit. Preparing an existing base is refused; choose a new base name
 or use `update` to modify it. Base images must not be symlinks.
 
-## Update an image interactively
+## Update an image
 
 ```bash
 ./virter update
 ```
 
-Any changes to the file system will be persisted.
+Without a command, update opens an interactive shell. To run a command and then shut down automatically:
+
+```bash
+./virter update -- sudo apt-get install -y ripgrep
+```
+
+The command runs as the invoking user, with passwordless sudo available, just like `run`.
+Use `--sudo` to run the entire command as root (requires a command):
+
+```bash
+./virter update --sudo -- sh -c 'apt update && apt -y upgrade'
+```
+
+Any changes to the file system will be persisted. Updates shut down orderly after the command finishes,
+including when it fails. As with `run`, virter's exit status reports VM execution, not the guest command's
+exit status; check the console output for command failures.
+Both guest stdout and stderr, plus QEMU diagnostics, appear on virter's stdout.
 
 ## Run an ephemeral instance
 

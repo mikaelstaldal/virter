@@ -221,6 +221,9 @@ def main():
     parser_update = subparsers.add_parser("update", help="Update base image")
     parser_update.add_argument("-b", "--base", type=logical_name, help="The base to update", default="base")
     parser_update.add_argument("-m", "--memory", type=bounded_integer(128, 8192), metavar="MiB", help="Memory in MiB (128-8192)", default=1024)
+    parser_update.add_argument("--sudo", action="store_true", help="Run the update command as root")
+    parser_update.add_argument("COMMAND", nargs="?", help="Command to run")
+    parser_update.add_argument("ARG", nargs="*", help="Arguments to command")
     parser_update.set_defaults(func=update)
 
     parser_run = subparsers.add_parser("run", help="Run an instance")
@@ -251,6 +254,8 @@ def main():
 
     args = parser.parse_args()
     if args.func:
+        if args.func == update and args.sudo and not args.COMMAND:
+            parser.error("update --sudo requires a command")
         if os.getuid() == 0 or os.geteuid() == 0:
             parser.error("virter must run as an unprivileged user; do not use sudo")
         if shutil.which("bwrap") is None:
@@ -287,11 +292,13 @@ def prepare(args):
 def update(args):
     base = args.base
     memory_mib = args.memory
-    prepare_or_update(None, base, memory_mib, None, [])
+    prepare_or_update(None, base, memory_mib, None, [],
+                      command=[args.COMMAND, *args.ARG] if args.COMMAND else None, sudo=args.sudo)
 
 
 def prepare_or_update(base_image: Path | None, base: str, memory_mib: int, disk_mib: int | None,
-                      packages: list[str], expected_sha256: str | None = None) -> None:
+                      packages: list[str], expected_sha256: str | None = None,
+                      command: list[str] | None = None, sudo: bool = False) -> None:
     name = base
     vm_uuid = str(uuid.uuid4())
 
@@ -329,7 +336,7 @@ def prepare_or_update(base_image: Path | None, base: str, memory_mib: int, disk_
         if base_image:
             cloud_init_prepare(name, temp_dir, packages)
         else:
-            cloud_init_update(name, temp_dir)
+            cloud_init_update(name, temp_dir, command, sudo=sudo)
 
         run_vm(name, vm_uuid, base_path, temp_dir, memory_mib, NetworkMode.HOST,
                base_image is not None, mounts=[], ephemeral=False)
@@ -482,11 +489,28 @@ power_state:
     )
 
 
-def cloud_init_update(name, temp_dir: Path):
+def cloud_init_update(name, temp_dir: Path, command: list[str] | None = None, sudo: bool = False):
+    command_data = ""
+    if command:
+        username = "root" if sudo else getpass.getuser()
+        cols, rows = shutil.get_terminal_size()
+        script = f"stty cols {cols} rows {rows}\n" + shlex.join(command) + "\n"
+        override = f"""[Service]
+ExecStart=
+ExecStart=-/usr/bin/sudo -i -u {username} -- /bin/bash /run/virter-command.sh
+ExecStart=/sbin/shutdown -h --no-wall now
+"""
+        dropin = "/run/systemd/system/serial-getty@ttyS1.service.d"
+        # bootcmd precedes write_files, so create the override before reloading systemd here.
+        setup = (f"mkdir -p {dropin} && "
+                 + shlex.join(["printf", "%s", script]) + " > /run/virter-command.sh && "
+                 + shlex.join(["printf", "%s", override]) + f" > {dropin}/zz-command.conf && "
+                 + "systemctl daemon-reload")
+        command_data = "bootcmd:\n- " + json.dumps(["sh", "-c", setup], ensure_ascii=False) + "\n"
     generate_cloud_init(
         name,
         temp_dir,
-        CLOUD_CONFIG_HEADER + "users: []\n",
+        CLOUD_CONFIG_HEADER + "users: []\n" + command_data,
         generate_locales=True
     )
 
