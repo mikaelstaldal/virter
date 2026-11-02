@@ -49,6 +49,15 @@ requested guest RAM plus 1024 MiB of host overhead, zero swap, and 128 tasks.
 Memory must be 128–8192 MiB; prepared virtual disks must be 1024–16384 MiB.
 Imported and existing images exceeding 16384 MiB virtual size or 20 GiB host file size are refused.
 At most two invocations can run concurrently per host user, across cache directories.
+
+The cache (`$XDG_CACHE_HOME/virter`, or `~/.cache/virter`) must be owned by the current user and have
+private permissions (0700). New cache directories are created privately; existing unsafe directories are
+rejected without changing their permissions. Cache paths must not contain symlinks or ancestors writable
+by other users, except root-owned sticky directories such as `/tmp`.
+Each instance uses an atomically created private directory with a random name. Per-base locks allow
+concurrent readers, while `prepare` and `update` wait for exclusive access for their entire operation.
+Lock files remain in the cache after use; do not remove them while virter invocations are active.
+
 The default wall-clock limit is one hour, including setup; all subcommands accept `--timeout SECONDS`
 from 1 to 86400. The entire scope is terminated on timeout, with forced termination after 15 seconds.
 Interrupted preparation or updates can leave an incomplete base image; inspect it before reuse.

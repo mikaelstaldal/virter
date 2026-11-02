@@ -1,4 +1,5 @@
 import argparse
+from contextlib import nullcontext
 import runpy
 import signal
 import subprocess
@@ -89,6 +90,7 @@ class LifecycleTests(unittest.TestCase):
                                     (v['prepare_or_update'], (None, 'base', 1024, None, []))):
             with self.subTest(function=function.__name__), \
                     patch.dict(function.__globals__, prepare_cache_dir=lambda: Path('/cache'),
+                               base_lock=lambda *a, **k: nullcontext(),
                                generate_cloud_init=Mock(), cloud_init_update=Mock(), validate_disk_size=Mock(),
                                run_vm=Mock(side_effect=v['ChildCleanupError']('unreaped'))), \
                     patch('pathlib.Path.is_file', return_value=True), \

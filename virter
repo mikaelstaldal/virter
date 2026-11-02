@@ -13,6 +13,7 @@ import shlex
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -76,6 +77,10 @@ def base_image_path(cache_dir: Path, base: str) -> Path:
     path = cache_dir / f"{base}.img"
     if path.is_symlink() or not path.resolve().is_relative_to(cache_dir.resolve()):
         sys.exit(f"Unsafe base image path: {path}")
+    if path.exists():
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
+            sys.exit(f"Unsafe base image file: {path}")
     return path
 
 
@@ -299,16 +304,26 @@ def update(args):
 def prepare_or_update(base_image: Path | None, base: str, memory_mib: int, disk_mib: int | None,
                       packages: list[str], expected_sha256: str | None = None,
                       command: list[str] | None = None, sudo: bool = False) -> None:
+    cache_dir = prepare_cache_dir()
+    with base_lock(cache_dir, base, exclusive=True):
+        _prepare_or_update(cache_dir, base_image, base, memory_mib, disk_mib, packages,
+                           expected_sha256, command, sudo)
+
+
+def _prepare_or_update(cache_dir: Path, base_image: Path | None, base: str, memory_mib: int,
+                       disk_mib: int | None, packages: list[str], expected_sha256: str | None,
+                       command: list[str] | None, sudo: bool):
     name = base
     vm_uuid = str(uuid.uuid4())
 
-    cache_dir = prepare_cache_dir()
     base_path = base_image_path(cache_dir, base)
 
     if base_image:
         validate_disk_size(base_image)
         try:
-            with base_image.open("rb") as source, base_path.open("xb") as destination:
+            with base_image.open("rb") as source, os.fdopen(
+                    os.open(base_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600),
+                    "wb") as destination:
                 try:
                     shutil.copyfileobj(source, destination)
                     destination.flush()
@@ -374,6 +389,12 @@ def collect_mounts(args) -> list[tuple[Path, bool]]:
 
 
 def run(args):
+    cache_dir = prepare_cache_dir()
+    with base_lock(cache_dir, args.base, exclusive=False):
+        _run(args, cache_dir)
+
+
+def _run(args, cache_dir: Path):
     name = args.name
     base = args.base
     memory_mib = args.memory
@@ -382,7 +403,6 @@ def run(args):
 
     vm_uuid = str(uuid.uuid4())
 
-    cache_dir = prepare_cache_dir()
     base_path = base_image_path(cache_dir, base)
 
     if not base_path.is_file():
@@ -610,8 +630,36 @@ def cache_directory() -> Path:
 
 def prepare_cache_dir() -> Path:
     cache_dir = cache_directory()
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    return cache_dir.resolve()
+    cache_dir = cache_dir.absolute()
+    # Check each component before creating children; never follow an attacker-prepared symlink.
+    for directory in (*reversed(cache_dir.parents), cache_dir):
+        try:
+            directory.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+        info = directory.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid not in (0, os.getuid()):
+            sys.exit(f"Unsafe cache directory: {directory}")
+        if info.st_mode & 0o022 and not (info.st_uid == 0 and info.st_mode & stat.S_ISVTX):
+            sys.exit(f"Cache ancestor is writable by other users: {directory}")
+    info = cache_dir.lstat()
+    if info.st_uid != os.getuid() or info.st_mode & 0o077:
+        sys.exit(f"Cache must be owned by the current user with private permissions (0700): {cache_dir}")
+    return cache_dir
+
+
+@contextmanager
+def base_lock(cache_dir: Path, base: str, exclusive: bool):
+    # Lock files persist: unlinking one would let waiters lock different inodes for the same base.
+    fd = os.open(cache_dir / f"{base}.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
+            sys.exit("Unsafe base lock file")
+        fcntl.flock(fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        yield
+    finally:
+        os.close(fd)
 
 
 def wait_for_socket(process: subprocess.Popen, socket_path: Path, timeout_seconds: float = 5):

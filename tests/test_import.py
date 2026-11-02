@@ -72,6 +72,7 @@ class ImportTests(unittest.TestCase):
                 command.assert_called_once_with(
                     ["qemu-img", "resize", "-f", "qcow2", "-q", str(cache / "base.img"), "8192M"], check=True)
                 self.assertEqual((cache / "base.img").read_bytes(), data)
+                self.assertEqual((cache / "base.img").stat().st_mode & 0o777, 0o600)
 
 
 if __name__ == "__main__":
