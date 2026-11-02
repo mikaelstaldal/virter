@@ -425,9 +425,13 @@ def _run(args, cache_dir: Path):
             str(img_path),
         ], check=True)
 
-        mount_data = "bootcmd:\n" + "".join(f"""- mkdir -p "{mount_dir}"
-- mount -t virtiofs {"-o ro" if mount_readonly else ""} virtiofs{i} "{mount_dir}"
-""" for i, (mount_dir, mount_readonly) in enumerate(mounts)) if mounts else ""
+        mount_commands = []
+        for i, (mount_dir, mount_readonly) in enumerate(mounts):
+            mount_commands.append(["mkdir", "-p", "--", str(mount_dir)])
+            mount_commands.append(["mount", "-t", "virtiofs", *(["-o", "ro"] if mount_readonly else []),
+                                   f"virtiofs{i}", str(mount_dir)])
+        mount_data = "bootcmd:\n" + "".join(
+            "- " + yaml_encode(command) + "\n" for command in mount_commands) if mounts else ""
 
         username = getpass.getuser()
         cols, rows = shutil.get_terminal_size()
@@ -440,13 +444,14 @@ def _run(args, cache_dir: Path):
             # forced poweroff would otherwise cut it off. If the poweroff fails, logout shuts down normally.
             profile_lines.append('sync; stty "$(stty -g)"; sudo poweroff -ff >/dev/null 2>&1')
             profile_lines.append("logout")
-        hushlogin_data = f"""- path: \"/home/{username}/.hushlogin\"
+        hushlogin_data = f"""- path: {yaml_encode(f"/home/{username}/.hushlogin")}
 """ if args.workdir or args.COMMAND else ""
+        profile = "\n".join(profile_lines) + "\n"
         command_data = f"""write_files:
-{hushlogin_data}- path: \"/home/{username}/.profile\"
+{hushlogin_data}- path: {yaml_encode(f"/home/{username}/.profile")}
   append: true
-  content: |
-""" + "".join(f"    {line}\n" for line in profile_lines)
+  content: {yaml_encode(profile)}
+"""
 
         generate_cloud_init(
             name,
@@ -460,32 +465,41 @@ def _run(args, cache_dir: Path):
             shutil.rmtree(temp_dir, ignore_errors=True)
 
 
+def yaml_encode(value) -> str:
+    # JSON quoting is YAML-compatible, except surrogate pairs and literal YAML line breaks.
+    encoded = json.dumps(value, ensure_ascii=False)
+    for character in (*map(chr, range(0x7f, 0xa0)), "\u2028", "\u2029", "\ufffe", "\uffff"):
+        encoded = encoded.replace(character, f"\\u{ord(character):04x}")
+    return encoded
+
+
 def cloud_init_prepare(name: str, temp_dir: Path, packages: list[str]):
     username = getpass.getuser()
     cols, rows = shutil.get_terminal_size()
+    getty_override = f"""[Service]
+ExecStart=
+ExecStart=-/usr/bin/login -p -f -- {username}
+ExecStart=/sbin/shutdown -h --no-wall now
+Type=oneshot
+Restart=no
+TTYColumns={cols}
+TTYRows={rows}
+"""
     generate_cloud_init(
         name,
         temp_dir,
         f"""{CLOUD_CONFIG_HEADER}user:
-  name: \"{username}\"
-  uid: \"{os.getuid()}\"
+  name: {yaml_encode(username)}
+  uid: {yaml_encode(str(os.getuid()))}
   groups: [adm, cdrom, dip, lxd, sudo]
   sudo: [\"ALL=(ALL) NOPASSWD:ALL\"]
   shell: /bin/bash
 package_update: true
 package_upgrade: true
-packages: {json.dumps(packages)}
+packages: {yaml_encode(packages)}
 write_files:
 - path: /etc/systemd/system/serial-getty@.service.d/override.conf
-  content: |
-    [Service]
-    ExecStart=
-    ExecStart=-/usr/bin/login -p -f -- {username}
-    ExecStart=/sbin/shutdown -h --no-wall now
-    Type=oneshot
-    Restart=no
-    TTYColumns={cols}
-    TTYRows={rows}
+  content: {yaml_encode(getty_override)}
 - path: /etc/default/grub.d/50-cloudimg-settings.cfg
   content: |
     GRUB_RECORDFAIL_TIMEOUT=0
@@ -526,7 +540,7 @@ ExecStart=/sbin/shutdown -h --no-wall now
                  + shlex.join(["printf", "%s", script]) + " > /run/virter-command.sh && "
                  + shlex.join(["printf", "%s", override]) + f" > {dropin}/zz-command.conf && "
                  + "systemctl daemon-reload")
-        command_data = "bootcmd:\n- " + json.dumps(["sh", "-c", setup], ensure_ascii=False) + "\n"
+        command_data = "bootcmd:\n- " + yaml_encode(["sh", "-c", setup]) + "\n"
     generate_cloud_init(
         name,
         temp_dir,
@@ -547,13 +561,12 @@ def guest_localization(vendor_data: str, generate_locales: bool = False) -> str:
     environment.setdefault("LANG", "C.UTF-8")
     timezone = read_timezone()
     if timezone:
-        vendor_data += f"timezone: {json.dumps(timezone)}\n"
+        vendor_data += f"timezone: {yaml_encode(timezone)}\n"
     # TZ also accepts POSIX rules, which cloud-init's timezone setting cannot represent.
     if "TZ" in os.environ:
         environment["TZ"] = os.environ["TZ"]
     profile = "".join(f"export {key}={shlex.quote(value)}\n" for key, value in environment.items())
-    file_data = ("- path: /etc/profile.d/virter-locale.sh\n  content: |\n"
-                 + "".join(f"    {line}\n" for line in profile.splitlines()))
+    file_data = "- path: /etc/profile.d/virter-locale.sh\n  content: " + yaml_encode(profile) + "\n"
     if re.search(r"^write_files:\n", vendor_data, re.MULTILINE):
         vendor_data = re.sub(r"^write_files:\n", lambda _: "write_files:\n" + file_data,
                              vendor_data, count=1, flags=re.MULTILINE)
@@ -562,7 +575,7 @@ def guest_localization(vendor_data: str, generate_locales: bool = False) -> str:
     locales = sorted({value for key, value in environment.items()
                       if key not in ("LANGUAGE", "TZ") and value not in ("C", "POSIX", "C.UTF-8", "C.utf8")})
     if generate_locales and locales:
-        command = "- " + json.dumps(["locale-gen", *locales]) + "\n"
+        command = "- " + yaml_encode(["locale-gen", *locales]) + "\n"
         # Generate locales before the getty can start a login shell.
         if re.search(r"^bootcmd:\n", vendor_data, re.MULTILINE):
             vendor_data = re.sub(r"^bootcmd:\n", lambda _: "bootcmd:\n" + command,
@@ -596,8 +609,8 @@ def read_timezone():
 def generate_cloud_init(name: str, temp_dir: Path, vendor_data: str, generate_locales: bool = False):
     # Reused base and instance names must still apply this invocation's cloud-config.
     (temp_dir / "meta-data").write_text(f"""#cloud-config
-instance-id: {name}-{uuid.uuid4()}
-local-hostname: {name}
+instance-id: {yaml_encode(f"{name}-{uuid.uuid4()}")}
+local-hostname: {yaml_encode(name)}
 cloud-name: virter
 """, encoding="utf-8")
     (temp_dir / "network-config").write_text("""#cloud-config

@@ -6,6 +6,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+
+def decoded_content(data):
+    return data + '\n' + '\n'.join(json.loads(line.removeprefix('  content: '))
+                                       for line in data.splitlines() if line.startswith('  content: "'))
+
+
 v = runpy.run_path(str(Path(__file__).resolve().parents[1] / 'virter'))
 
 
@@ -18,7 +24,7 @@ class LocaleTests(unittest.TestCase):
             data = v['guest_localization'](
                 '#cloud-config\nwrite_files:\n- path: /existing\nbootcmd:\n- echo existing\n', generate_locales=True)
         for key, value in environment.items():
-            self.assertIn(f'export {key}={value}\n', data)
+            self.assertIn(f'export {key}={value}\n', decoded_content(data))
         self.assertIn('timezone: "Europe/Stockholm"', data)
         self.assertIn(json.dumps(['locale-gen', 'de_DE.UTF-8', 'fr_FR.UTF-8', 'sv_SE.UTF-8']), data)
         self.assertEqual(data.count('write_files:\n'), 1)
@@ -30,7 +36,7 @@ class LocaleTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True), \
                 patch.dict(v['guest_localization'].__globals__, read_timezone=lambda: ''):
             data = v['guest_localization']('#cloud-config\nusers: []\n')
-        self.assertIn('export LANG=C.UTF-8', data)
+        self.assertIn('export LANG=C.UTF-8', decoded_content(data))
         self.assertNotIn('locale-gen', data)
         self.assertNotIn('timezone:', data)
 
@@ -38,8 +44,8 @@ class LocaleTests(unittest.TestCase):
         with patch.dict(os.environ, {'LANG': 'C', 'LANGUAGE': 'sv; touch /tmp/oops',
                                      'SECRET': 'hidden', 'TZ': ''}, clear=True):
             data = v['guest_localization']('#cloud-config\n')
-        self.assertIn("export LANGUAGE='sv; touch /tmp/oops'", data)
-        self.assertIn("export TZ=''", data)
+        self.assertIn("export LANGUAGE='sv; touch /tmp/oops'", decoded_content(data))
+        self.assertIn("export TZ=''", decoded_content(data))
         self.assertNotIn('SECRET', data)
 
     def test_timezone_override_and_system_fallback(self):
@@ -67,7 +73,7 @@ class LocaleTests(unittest.TestCase):
                 generate()
                 self.assertNotEqual(first_metadata, (directory / 'meta-data').read_text())
                 data = (directory / 'vendor-data').read_text()
-                self.assertIn('export LANG=de_DE.UTF-8', data)
+                self.assertIn('export LANG=de_DE.UTF-8', decoded_content(data))
                 if generates_locales:
                     commands = data.split('bootcmd:\n', 1)[1].splitlines()
                     self.assertTrue(commands)
