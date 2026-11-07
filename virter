@@ -240,6 +240,8 @@ def main():
                               help=f"Network mode (default: {default}); bridge requires the administrator setup in "
                                    "NETWORKING.md; host enables unrestricted QEMU user-mode NAT "
                                    "with access to host services, LAN and internet")
+    parser_run.add_argument("--allow-sudo", action="store_true",
+                            help="Allow passwordless sudo in the ephemeral guest")
     parser_run.add_argument("-w", "--workdir", metavar="DIR", help="Change to this directory inside the VM")
     parser_run.add_argument("--mount", type=Path, metavar="DIR", action="append", default=[],
                             help="Mount a directory in VM read-only, can be repeated")
@@ -433,15 +435,23 @@ def _run(args, cache_dir: Path):
             str(img_path),
         ], check=True)
 
+        username = getpass.getuser()
+        # Cloud-init logs bootcmd failures and continues; block autologin if privilege removal fails.
+        restrict_user = (
+            "if ! " + shlex.join(["usermod", "-G", "", "--", username])
+            + " || ! rm -f /etc/sudoers.d/90-cloud-init-users; then "
+            + "systemctl mask --runtime --now serial-getty@ttyS1.service; "
+            + "/usr/sbin/poweroff -ff; exit 1; fi")
+        privilege_commands = [] if args.allow_sudo else [["sh", "-c", restrict_user]]
         mount_commands = []
         for i, (mount_dir, mount_readonly) in enumerate(mounts):
             mount_commands.append(["mkdir", "-p", "--", str(mount_dir)])
             mount_commands.append(["mount", "-t", "virtiofs", *(["-o", "ro"] if mount_readonly else []),
                                    f"virtiofs{i}", str(mount_dir)])
+        boot_commands = privilege_commands + mount_commands
         mount_data = "bootcmd:\n" + "".join(
-            "- " + yaml_encode(command) + "\n" for command in mount_commands) if mounts else ""
+            "- " + yaml_encode(command) + "\n" for command in boot_commands) if boot_commands else ""
 
-        username = getpass.getuser()
         cols, rows = shutil.get_terminal_size()
         profile_lines = [f"stty cols {cols} rows {rows}"]
         if args.workdir:
@@ -450,13 +460,18 @@ def _run(args, cache_dir: Path):
             profile_lines.append(shlex.join(args.COMMAND))
             # The image is discarded, so skip the slow orderly shutdown. Drain the serial output first, a
             # forced poweroff would otherwise cut it off. If the poweroff fails, logout shuts down normally.
-            profile_lines.append('sync; stty "$(stty -g)"; sudo poweroff -ff >/dev/null 2>&1')
+            profile_lines.append('sync; stty "$(stty -g)"; sudo -n /usr/sbin/poweroff -ff >/dev/null 2>&1')
             profile_lines.append("logout")
         hushlogin_data = f"""- path: {yaml_encode(f"/home/{username}/.hushlogin")}
 """ if args.workdir or args.COMMAND else ""
         profile = "\n".join(profile_lines) + "\n"
+        poweroff_rule = f"#{os.getuid()} ALL=(root) NOPASSWD: /usr/sbin/poweroff -ff\n"
+        sudo_data = "" if args.allow_sudo else f"""- path: /etc/sudoers.d/virter-poweroff
+  permissions: '0440'
+  content: {yaml_encode(poweroff_rule)}
+"""
         command_data = f"""write_files:
-{hushlogin_data}- path: {yaml_encode(f"/home/{username}/.profile")}
+{sudo_data}{hushlogin_data}- path: {yaml_encode(f"/home/{username}/.profile")}
   append: true
   content: {yaml_encode(profile)}
 """

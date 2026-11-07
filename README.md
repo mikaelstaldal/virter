@@ -126,7 +126,7 @@ Without a command, update opens an interactive shell. To run a command and then 
 ./virter update -- sudo apt-get install -y ripgrep
 ```
 
-The command runs as the invoking user, with passwordless sudo available, just like `run`.
+The command runs as the invoking user, with passwordless sudo available.
 Use `--sudo` to run the entire command as root (requires a command):
 
 ```bash
@@ -142,6 +142,11 @@ Both guest stdout and stderr, plus QEMU diagnostics, appear on virter's stdout.
 
 Changes to the instance disk are discarded when the instance exits. Writes to writable host shares persist
 on the host, including when the VM fails; deleting the instance disk does not undo them.
+
+The guest user keeps the host UID for writable shares, but has no supplementary groups and can use sudo
+only for forced poweroff. Use `./virter run --allow-sudo` to allow passwordless sudo for guest administration.
+This affects only the ephemeral instance; `prepare` and `update` retain administrative access.
+Trusted base images must not grant additional privileges through custom sudo rules or other mechanisms.
 
 Runs are offline by default (`--network none`). To explicitly enable networking:
 

@@ -83,7 +83,7 @@ class LifecycleTests(unittest.TestCase):
         child.wait.assert_called_with(timeout=5)
 
     def test_callers_retain_resources_if_reaping_fails(self):
-        args = argparse.Namespace(name='instance', base='base', memory=1024, network='none',
+        args = argparse.Namespace(name='instance', base='base', memory=1024, network='none', allow_sudo=False,
                                   mount=[], mount_writable=[], current_dir=False, current_dir_writable=False,
                                   workdir=None, COMMAND=None)
         for function, arguments in ((v['run'], (args,)),

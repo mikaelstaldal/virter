@@ -27,7 +27,7 @@ class MountSafetyTests(unittest.TestCase):
             output_dir.mkdir()
             for writable, current in ((True, False), (False, True), (False, False)):
                 args = argparse.Namespace(
-                    name="instance", base="base", memory=1024, network="none",
+                    name="instance", base="base", memory=1024, network="none", allow_sudo=False,
                     mount=[] if current else [inputs],
                     mount_writable=[output_dir] if writable else [],
                     current_dir=False, current_dir_writable=current)

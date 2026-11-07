@@ -20,7 +20,7 @@ class CloudInitEncodingTests(unittest.TestCase):
             workdir = 'work\nnext "$(id)"'
             username = 'a"user'
             generate = Mock()
-            args = argparse.Namespace(name='instance', base='base', memory=1024, network='none',
+            args = argparse.Namespace(name='instance', base='base', memory=1024, network='none', allow_sudo=False,
                                       workdir=workdir, COMMAND=command)
             with patch.dict(v['_run'].__globals__, collect_mounts=lambda _: [(paths[0], True), (paths[1], False)],
                             base_image_path=lambda *_: cache / 'base.qcow2', validate_disk_size=Mock(),
@@ -29,12 +29,14 @@ class CloudInitEncodingTests(unittest.TestCase):
                 v['_run'](args, cache)
             data = generate.call_args.kwargs['vendor_data']
         boot, files = data.split('bootcmd:\n')[1].split('write_files:\n')
-        self.assertEqual([json.loads(line[2:]) for line in boot.splitlines()], [
+        self.assertEqual([json.loads(line[2:]) for line in boot.splitlines()][1:], [
             ['mkdir', '-p', '--', str(paths[0])],
             ['mount', '-t', 'virtiofs', '-o', 'ro', 'virtiofs0', str(paths[0])],
             ['mkdir', '-p', '--', str(paths[1])],
             ['mount', '-t', 'virtiofs', 'virtiofs1', str(paths[1])]])
-        script = json.loads(files.split('  content: ', 1)[1].strip())
+        setup = json.loads(boot.splitlines()[0][2:])
+        self.assertIn(shlex.join(['usermod', '-G', '', '--', username]), setup[2])
+        script = json.loads(files.rsplit('  content: ', 1)[1].strip())
         self.assertIn('cd ' + shlex.quote(workdir) + '\n', script)
         self.assertIn(shlex.join(command) + '\n', script)
         self.assertIn('- path: ' + json.dumps(f'/home/{username}/.profile') + '\n', files)
@@ -68,3 +70,46 @@ class CloudInitEncodingTests(unittest.TestCase):
         self.assertEqual(len(lines), 4)
         self.assertEqual(json.loads(lines[3].removeprefix('  content: ')),
                          'export LANG=' + shlex.quote(value) + '\n')
+
+
+class GuestPrivilegeTests(unittest.TestCase):
+    def test_run_privileges_and_shutdown(self):
+        for root in (False, True):
+            with self.subTest(allow_sudo=root), tempfile.TemporaryDirectory() as directory:
+                cache = Path(directory)
+                base = cache / 'base.img'
+                base.touch()
+                generate = Mock()
+                args = argparse.Namespace(name='instance', base='base', memory=1024, network='none',
+                                          allow_sudo=root, workdir=None, COMMAND=['true'])
+                with patch.dict(v['_run'].__globals__, collect_mounts=lambda _: [],
+                                base_image_path=lambda *_: base, validate_disk_size=Mock(),
+                                generate_cloud_init=generate, run_vm=Mock()), \
+                        patch('subprocess.run'), patch('getpass.getuser', return_value='tester'), \
+                        patch('os.getuid', return_value=1234):
+                    v['_run'](args, cache)
+                data = generate.call_args.kwargs['vendor_data']
+                self.assertEqual('bootcmd:' in data, not root)
+                self.assertEqual('/etc/sudoers.d/90-cloud-init-users' in data, not root)
+                self.assertEqual('/etc/sudoers.d/virter-poweroff' in data, not root)
+                if not root:
+                    commands = data.split('bootcmd:\n')[1].split('write_files:\n')[0]
+                    setup, = [json.loads(line[2:]) for line in commands.splitlines()]
+                    self.assertEqual(setup[:2], ['sh', '-c'])
+                    self.assertIn("if ! usermod -G '' -- tester || ! rm -f /etc/sudoers.d/90-cloud-init-users", setup[2])
+                    self.assertIn('systemctl mask --runtime --now serial-getty@ttyS1.service', setup[2])
+                    self.assertIn('/usr/sbin/poweroff -ff; exit 1', setup[2])
+                    self.assertIn("permissions: '0440'", data)
+                    rule = json.loads(data.split('  content: ', 1)[1].splitlines()[0])
+                    self.assertEqual(rule, '#1234 ALL=(root) NOPASSWD: /usr/sbin/poweroff -ff\n')
+                profile = json.loads(data.rsplit('  content: ', 1)[1].strip())
+                self.assertIn('sudo -n /usr/sbin/poweroff -ff', profile)
+
+    def test_preparation_retains_sudo_and_uid(self):
+        generate = Mock()
+        with patch.dict(v['cloud_init_prepare'].__globals__, generate_cloud_init=generate), \
+                patch('os.getuid', return_value=1234), patch('getpass.getuser', return_value='tester'):
+            v['cloud_init_prepare']('base', Path('/unused'), [])
+        data = generate.call_args.args[2]
+        self.assertIn('NOPASSWD:ALL', data)
+        self.assertIn('uid: "1234"', data)

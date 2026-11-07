@@ -21,7 +21,7 @@ class CommandBoundaryTests(unittest.TestCase):
         injected = [
             "--network=host", "--network", "host", "--mount-writable=/home/me",
             "--mount-w=/home/me", "-n../../evil", "-b../../evil", "-m999999",
-            "-w/tmp", "--timeout=86400", "--sudo", "--help", "--", "", "tail",
+            "-w/tmp", "--timeout=86400", "--sudo", "--allow-sudo", "--help", "--", "", "tail",
         ]
         for action in ("run", "update"):
             for separator in ([], ["--"]):
@@ -35,6 +35,7 @@ class CommandBoundaryTests(unittest.TestCase):
                         self.assertEqual(args.timeout, 3600)
                         self.assertEqual(args.COMMAND, ["./test.sh", *injected, *suffix])
                         if action == "run":
+                            self.assertFalse(args.allow_sudo)
                             self.assertEqual(args.mount_writable, [])
                             self.assertIsNone(args.workdir)
                         else:

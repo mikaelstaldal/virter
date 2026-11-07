@@ -70,7 +70,7 @@ class NameSafetyTests(unittest.TestCase):
             cache = Path(directory)
             for filename in ("base.img", "instance.img", "instance.pid"):
                 (cache / filename).write_bytes(b"preserve")
-            args = argparse.Namespace(name="instance", base="base", memory=1024, network="none",
+            args = argparse.Namespace(name="instance", base="base", memory=1024, network="none", allow_sudo=False,
                                       mount=[], mount_writable=[], current_dir=False, current_dir_writable=False,
                                       workdir=None, COMMAND=None)
             globals_ = v["run"].__globals__
