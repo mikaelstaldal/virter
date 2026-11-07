@@ -181,6 +181,10 @@ the guest shell even when they cannot be used as a system timezone.
 ./virter run -- ls -A /
 ```
 
+For `run` and `update`, put all virter options before the command. Every token after the command is passed
+to the guest unchanged, including option-like arguments. An optional `--` separates virter options from
+the command. Omitting the command starts an interactive shell; an empty command name is rejected.
+
 Both stdout and stderr from the instance, plus QEMU diagnostics, end up in stdout from the virter command.
 
 ### With a directory on the host mounted writable

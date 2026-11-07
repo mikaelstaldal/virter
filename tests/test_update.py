@@ -14,8 +14,8 @@ class UpdateTests(unittest.TestCase):
     def test_update_passes_command_to_persistent_image_setup(self):
         setup = Mock()
         with patch.dict(v['update'].__globals__, prepare_or_update=setup):
-            v['update'](argparse.Namespace(base='custom', memory=2048, COMMAND='echo',
-                                           ARG=['hello world'], sudo=False, network='host'))
+            v['update'](argparse.Namespace(base='custom', memory=2048, COMMAND=['echo', 'hello world'],
+                                           sudo=False, network='host'))
         setup.assert_called_once_with(None, 'custom', 2048, None, [], command=['echo', 'hello world'], sudo=False,
                                       network=v['NetworkMode'].HOST)
 
@@ -27,7 +27,7 @@ class UpdateTests(unittest.TestCase):
                 patch('shutil.which', return_value='/usr/bin/bwrap'):
             v['main']()
         args = dispatch.call_args.args[0]
-        self.assertEqual((args.base, args.COMMAND, args.ARG), ('custom', 'echo', ['-n', 'hello world']))
+        self.assertEqual((args.base, args.COMMAND), ('custom', ['echo', '-n', 'hello world']))
 
     def test_command_seed_is_transient_quoted_and_shuts_down_orderly(self):
         command = ['printf', '%s', 'hello world', "a; $(touch /oops)\n'quoted'", "😀"]
@@ -76,10 +76,12 @@ class UpdateTests(unittest.TestCase):
                           'network': v['NetworkMode'].HOST})
 
     def test_sudo_requires_command(self):
-        with patch('sys.argv', ['virter', 'update', '--sudo']), patch('sys.stderr'), \
-                self.assertRaises(SystemExit) as error:
-            v['main']()
-        self.assertEqual(error.exception.code, 2)
+        for separator in ([], ['--']):
+            with self.subTest(separator=separator), \
+                    patch('sys.argv', ['virter', 'update', '--sudo', *separator]), patch('sys.stderr'), \
+                    self.assertRaises(SystemExit) as error:
+                v['main']()
+            self.assertEqual(error.exception.code, 2)
 
     def test_prepare_and_update_network_selection_reaches_qemu(self):
         for action in ('prepare', 'update'):

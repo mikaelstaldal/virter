@@ -227,8 +227,8 @@ def main():
     parser_update.add_argument("-b", "--base", type=logical_name, help="The base to update", default="base")
     parser_update.add_argument("-m", "--memory", type=bounded_integer(128, 8192), metavar="MiB", help="Memory in MiB (128-8192)", default=1024)
     parser_update.add_argument("--sudo", action="store_true", help="Run the update command as root")
-    parser_update.add_argument("COMMAND", nargs="?", help="Command to run")
-    parser_update.add_argument("ARG", nargs="*", help="Arguments to command")
+    parser_update.add_argument("COMMAND", nargs=argparse.REMAINDER,
+                            help="Command and arguments; virter options must precede the command")
     parser_update.set_defaults(func=update)
 
     parser_run = subparsers.add_parser("run", help="Run an instance")
@@ -250,8 +250,8 @@ def main():
                                     help="Mount the current directory in VM read-only")
     current_dir_mounts.add_argument("--current-dir-writable", action='store_true',
                                     help="Mount the current host directory writable; host changes persist after exit")
-    parser_run.add_argument("COMMAND", nargs="?", help="Command to run")
-    parser_run.add_argument("ARG", nargs="*", help="Arguments to command")
+    parser_run.add_argument("COMMAND", nargs=argparse.REMAINDER,
+                            help="Command and arguments; virter options must precede the command")
     parser_run.set_defaults(func=run)
 
     for subparser in (parser_prepare, parser_update, parser_run):
@@ -260,6 +260,11 @@ def main():
 
     args = parser.parse_args()
     if args.func:
+        if args.func in (run, update):
+            if args.COMMAND[:1] == ["--"]:
+                args.COMMAND = args.COMMAND[1:]
+            if args.COMMAND and not args.COMMAND[0]:
+                parser.error("command name must not be empty")
         if args.func == update and args.sudo and not args.COMMAND:
             parser.error("update --sudo requires a command")
         if os.getuid() == 0 or os.geteuid() == 0:
@@ -299,7 +304,7 @@ def update(args):
     base = args.base
     memory_mib = args.memory
     prepare_or_update(None, base, memory_mib, None, [],
-                      command=[args.COMMAND, *args.ARG] if args.COMMAND else None, sudo=args.sudo,
+                      command=args.COMMAND or None, sudo=args.sudo,
                       network=NetworkMode(args.network))
 
 
@@ -442,7 +447,7 @@ def _run(args, cache_dir: Path):
         if args.workdir:
             profile_lines.append(f"cd {shlex.quote(args.workdir)}")
         if args.COMMAND:
-            profile_lines.append(shlex.join([args.COMMAND, *args.ARG]))
+            profile_lines.append(shlex.join(args.COMMAND))
             # The image is discarded, so skip the slow orderly shutdown. Drain the serial output first, a
             # forced poweroff would otherwise cut it off. If the poweroff fails, logout shuts down normally.
             profile_lines.append('sync; stty "$(stty -g)"; sudo poweroff -ff >/dev/null 2>&1')

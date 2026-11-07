@@ -21,7 +21,7 @@ class CloudInitEncodingTests(unittest.TestCase):
             username = 'a"user'
             generate = Mock()
             args = argparse.Namespace(name='instance', base='base', memory=1024, network='none',
-                                      workdir=workdir, COMMAND=command[0], ARG=command[1:])
+                                      workdir=workdir, COMMAND=command)
             with patch.dict(v['_run'].__globals__, collect_mounts=lambda _: [(paths[0], True), (paths[1], False)],
                             base_image_path=lambda *_: cache / 'base.qcow2', validate_disk_size=Mock(),
                             generate_cloud_init=generate, run_vm=Mock()), \
