@@ -11,6 +11,18 @@ v = runpy.run_path(str(Path(__file__).resolve().parents[1] / 'virter'))
 
 
 class CacheTests(unittest.TestCase):
+    def test_runtime_directory_is_fixed_and_rejects_unsafe_metadata(self):
+        with patch('os.getuid', return_value=1000), \
+                patch.dict(os.environ, TMPDIR='/shared/tmp', XDG_RUNTIME_DIR='/shared/runtime'):
+            for mode, owner in ((0o40700, 1000), (0o40755, 1000), (0o40700, 1001), (0o120700, 1000), (0o100700, 1000)):
+                with self.subTest(mode=mode, owner=owner), patch(
+                        'pathlib.Path.lstat', return_value=argparse.Namespace(st_mode=mode, st_uid=owner)):
+                    if mode == 0o40700 and owner == 1000:
+                        self.assertEqual(v['runtime_directory'](), Path('/run/user/1000'))
+                    else:
+                        with self.assertRaises(SystemExit):
+                            v['runtime_directory']()
+
     def test_cache_home_requires_absolute_path(self):
         for value in ("", ".", "relative/cache"):
             with self.subTest(value=value), patch.dict(os.environ, XDG_CACHE_HOME=value):

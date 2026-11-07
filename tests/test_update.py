@@ -11,6 +11,14 @@ v = runpy.run_path(str(Path(__file__).resolve().parents[1] / 'virter'))
 
 
 class UpdateTests(unittest.TestCase):
+    def setUp(self):
+        runtime = tempfile.TemporaryDirectory()
+        self.addCleanup(runtime.cleanup)
+        self.runtime = Path(runtime.name)
+        runtime_patch = patch.dict(v['main'].__globals__, runtime_directory=lambda: self.runtime)
+        runtime_patch.start()
+        self.addCleanup(runtime_patch.stop)
+
     def test_update_passes_command_to_persistent_image_setup(self):
         setup = Mock()
         with patch.dict(v['update'].__globals__, prepare_or_update=setup):
@@ -107,3 +115,5 @@ class UpdateTests(unittest.TestCase):
                             patch('shutil.which', return_value='/usr/bin/bwrap'):
                         v['main']()
                     self.assertEqual(vm.call_args.args[5], v['NetworkMode'](network or 'host'))
+                    self.assertEqual(vm.call_args.args[3].parent, self.runtime)
+                    self.assertFalse(vm.call_args.args[3].exists())

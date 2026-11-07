@@ -74,6 +74,7 @@ class ResourceTests(unittest.TestCase):
 
             with patch('pathlib.Path.read_text', read), \
                     patch('pathlib.Path.stat', return_value=argparse.Namespace(st_uid=1000, st_mode=0o40700)), \
+                    patch('pathlib.Path.lstat', return_value=argparse.Namespace(st_uid=1000, st_mode=0o40700)), \
                     patch('os.getuid', return_value=1000), patch('os.open', side_effect=open_lock), \
                     patch('resource.setrlimit') as limit:
                 args = argparse.Namespace(memory=1024, _supervised='test.scope')

@@ -18,6 +18,25 @@ def mounts(readonly=(), writable=(), current_dir=False, current_dir_writable=Fal
 
 
 class MountSafetyTests(unittest.TestCase):
+    def setUp(self):
+        runtime = tempfile.TemporaryDirectory()
+        self.addCleanup(runtime.cleanup)
+        self.runtime = Path(runtime.name)
+        runtime_patch = patch.dict(v['main'].__globals__, runtime_directory=lambda: self.runtime)
+        runtime_patch.start()
+        self.addCleanup(runtime_patch.stop)
+
+    def test_runtime_is_protected_in_both_modes_and_through_aliases(self):
+        alias = self.runtime.parent / (self.runtime.name + '-alias')
+        alias.symlink_to(self.runtime, target_is_directory=True)
+        self.addCleanup(alias.unlink)
+        child = self.runtime / 'other-invocation'
+        child.mkdir()
+        for path in (self.runtime.parent, self.runtime, child, alias):
+            for readonly in (True, False):
+                with self.subTest(path=path, readonly=readonly), self.assertRaisesRegex(SystemExit, "Refusing"):
+                    mounts([path] if readonly else [], [] if readonly else [path])
+
     def test_allowed_mounts_do_not_print_warnings(self):
         with tempfile.TemporaryDirectory() as directory:
             parent = Path(directory)
@@ -66,7 +85,11 @@ class MountSafetyTests(unittest.TestCase):
                                     self.assertRaisesRegex(SystemExit, "exposes the home directory"):
                                 mounts(current_dir=True)
                         else:
-                            self.assertEqual(mounts([path]), [(path.resolve(), True)])
+                            with self.assertRaisesRegex(SystemExit, "exposes the virter cache"):
+                                mounts([path])
+                            with patch("os.getcwd", return_value=str(path.resolve())), \
+                                    self.assertRaisesRegex(SystemExit, "exposes the virter cache"):
+                                mounts(current_dir=True)
                 work = home / "work"
                 work.mkdir()
                 self.assertEqual(mounts(writable=[work]), [(work, False)])

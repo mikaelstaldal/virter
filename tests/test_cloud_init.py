@@ -11,6 +11,14 @@ v = runpy.run_path(str(Path(__file__).resolve().parents[1] / 'virter'))
 
 
 class CloudInitEncodingTests(unittest.TestCase):
+    def setUp(self):
+        runtime = tempfile.TemporaryDirectory()
+        self.addCleanup(runtime.cleanup)
+        self.runtime = Path(runtime.name)
+        runtime_patch = patch.dict(v['main'].__globals__, runtime_directory=lambda: self.runtime)
+        runtime_patch.start()
+        self.addCleanup(runtime_patch.stop)
+
     def test_mount_arguments_and_multiline_profile_remain_data(self):
         with tempfile.TemporaryDirectory() as directory:
             cache = Path(directory)
@@ -73,6 +81,14 @@ class CloudInitEncodingTests(unittest.TestCase):
 
 
 class GuestPrivilegeTests(unittest.TestCase):
+    def setUp(self):
+        runtime = tempfile.TemporaryDirectory()
+        self.addCleanup(runtime.cleanup)
+        self.runtime = Path(runtime.name)
+        runtime_patch = patch.dict(v['main'].__globals__, runtime_directory=lambda: self.runtime)
+        runtime_patch.start()
+        self.addCleanup(runtime_patch.stop)
+
     def test_run_privileges_and_shutdown(self):
         for root in (False, True):
             with self.subTest(allow_sudo=root), tempfile.TemporaryDirectory() as directory:

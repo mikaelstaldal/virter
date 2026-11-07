@@ -13,6 +13,12 @@ v = runpy.run_path(str(Path(__file__).resolve().parents[1] / "virter"))
 
 class NameSafetyTests(unittest.TestCase):
     def setUp(self):
+        runtime = tempfile.TemporaryDirectory()
+        self.addCleanup(runtime.cleanup)
+        self.runtime = Path(runtime.name)
+        runtime_patch = patch.dict(v['main'].__globals__, runtime_directory=lambda: self.runtime)
+        runtime_patch.start()
+        self.addCleanup(runtime_patch.stop)
         patcher = patch.dict(v["run_vm"].__globals__, relay_output=lambda stream: None)
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -63,7 +69,7 @@ class NameSafetyTests(unittest.TestCase):
         self.assertEqual(arguments[arguments.index("-smp") + 1], str(v["VM_CPUS"]))
         self.assertNotIn("-pidfile", arguments)
         self.assertIn("file=/cache,,a/disk.img,if=virtio,index=0,format=qcow2,media=disk,bps=268435456,iops=16384,cache=unsafe", arguments)
-        self.assertIn("file=/tmp,,b/seed.img,index=1,media=cdrom", arguments)
+        self.assertIn("file=/tmp,,b/seed.img,index=1,media=cdrom,format=raw,readonly=on", arguments)
 
     def test_run_isolates_image_and_preserves_name_derived_files(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -73,14 +79,18 @@ class NameSafetyTests(unittest.TestCase):
             args = argparse.Namespace(name="instance", base="base", memory=1024, network="none", allow_sudo=False,
                                       mount=[], mount_writable=[], current_dir=False, current_dir_writable=False,
                                       workdir=None, COMMAND=None)
+            seed_directories = []
             globals_ = v["run"].__globals__
             with patch.dict(globals_, prepare_cache_dir=lambda: cache, generate_cloud_init=lambda *a, **k: None,
-                            run_vm=lambda *a, **k: None), patch("subprocess.run") as command:
+                            run_vm=lambda *a, **k: seed_directories.append(a[3])), patch("subprocess.run") as command:
                 v["run"](args)
             image = Path(command.call_args.args[0][-1])
             self.assertEqual(image.name, "disk.img")
             self.assertEqual(image.parent.parent, cache)
             self.assertFalse(image.parent.exists())
+            self.assertEqual(seed_directories[0].parent, self.runtime)
+            self.assertNotEqual(image.parent, seed_directories[0])
+            self.assertFalse(seed_directories[0].exists())
             for filename in ("base.img", "instance.img", "instance.pid"):
                 self.assertEqual((cache / filename).read_bytes(), b"preserve")
 

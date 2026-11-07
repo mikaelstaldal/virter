@@ -13,6 +13,12 @@ v = runpy.run_path(str(Path(__file__).resolve().parents[1] / "virter"))
 
 class ConfinementTests(unittest.TestCase):
     def setUp(self):
+        runtime = tempfile.TemporaryDirectory()
+        self.addCleanup(runtime.cleanup)
+        self.runtime = Path(runtime.name)
+        runtime_patch = patch.dict(v['main'].__globals__, runtime_directory=lambda: self.runtime)
+        runtime_patch.start()
+        self.addCleanup(runtime_patch.stop)
         patcher = patch.dict(v["run_vm"].__globals__, relay_output=lambda stream: None)
         patcher.start()
         self.addCleanup(patcher.stop)

@@ -24,6 +24,13 @@ def image_header(version=3, backing=0, features=0):
 
 
 class ImportTests(unittest.TestCase):
+    def setUp(self):
+        runtime = tempfile.TemporaryDirectory()
+        self.addCleanup(runtime.cleanup)
+        runtime_patch = patch.dict(v['main'].__globals__, runtime_directory=lambda: Path(runtime.name))
+        runtime_patch.start()
+        self.addCleanup(runtime_patch.stop)
+
     def test_cli_requires_valid_digest(self):
         for extra in ([], ["--sha256", "bad"], ["--sha256", "z" * 64]):
             with self.subTest(extra=extra), patch("sys.argv", ["virter", "prepare", "-i", "image", *extra]), \

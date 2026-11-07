@@ -3,6 +3,7 @@ from contextlib import nullcontext
 import runpy
 import signal
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -12,6 +13,12 @@ v = runpy.run_path(str(Path(__file__).resolve().parents[1] / 'virter'))
 
 class LifecycleTests(unittest.TestCase):
     def setUp(self):
+        runtime = tempfile.TemporaryDirectory()
+        self.addCleanup(runtime.cleanup)
+        self.runtime = Path(runtime.name)
+        runtime_patch = patch.dict(v['main'].__globals__, runtime_directory=lambda: self.runtime)
+        runtime_patch.start()
+        self.addCleanup(runtime_patch.stop)
         patcher = patch.dict(v["run_vm"].__globals__, relay_output=lambda stream: None)
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -94,7 +101,7 @@ class LifecycleTests(unittest.TestCase):
                                generate_cloud_init=Mock(), cloud_init_update=Mock(), validate_disk_size=Mock(),
                                run_vm=Mock(side_effect=v['ChildCleanupError']('unreaped'))), \
                     patch('pathlib.Path.is_file', return_value=True), \
-                    patch('tempfile.mkdtemp', return_value='/cache/temporary'), \
+                    patch('tempfile.mkdtemp', side_effect=['/runtime/seed', '/cache/disk']), \
                     patch('subprocess.run'), patch('shutil.rmtree') as remove:
                 with self.assertRaises(v['ChildCleanupError']):
                     function(*arguments)

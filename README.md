@@ -201,8 +201,10 @@ Both stdout and stderr from the instance, plus QEMU diagnostics, end up in stdou
 `--mount-writable` and `--current-dir-writable` give the guest persistent write authority over the shared
 host directory. A guest can alter source code, executables, build configuration or shell startup files that
 later execute on the host. QEMU confinement does not prevent these authorized writes through virtiofsd.
-Writable mounts overlapping the virter cache (normally `$XDG_CACHE_HOME/virter`,
-or `~/.cache/virter`) are also refused, protecting base images and other instances. Paths are resolved before
+Mounts in either mode overlapping the virter cache (normally `$XDG_CACHE_HOME/virter`,
+or `~/.cache/virter`) are also refused, protecting base images and other instances.
+Cloud-init seeds and virtiofs sockets live under `/run/user/UID`, independently of `TMPDIR` and
+`XDG_RUNTIME_DIR`. Shares overlapping that runtime directory are refused in either mode. Paths are resolved before
 these checks, including symlink aliases. Other directories inside your home can still be shared writable;
 avoid sharing credentials or an active checkout.
 
