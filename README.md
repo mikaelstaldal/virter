@@ -8,6 +8,10 @@
 sudo apt install python3 qemu-system-x86 qemu-utils genisoimage virtiofsd bubblewrap
 ```
 
+External host tools use fixed system paths under `/usr/bin` (virtiofsd uses `/usr/libexec/virtiofsd`).
+Install the Ubuntu packages above; executables in the current directory or custom PATH entries are not used.
+An empty or relative `XDG_CACHE_HOME` is ignored; the cache then defaults to `~/.cache/virter`.
+
 ## Host confinement
 
 Run virter as an ordinary user with access to `/dev/kvm`; root execution is refused.

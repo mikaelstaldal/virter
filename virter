@@ -144,7 +144,7 @@ def bounded_integer(minimum: int, maximum: int):
 def supervise(args):
     unit = f"virter-{uuid.uuid4()}.scope"
     command = [
-        "systemd-run", "--user", "--scope", "--quiet", "--collect", "--expand-environment=no",
+        "/usr/bin/systemd-run", "--user", "--scope", "--quiet", "--collect", "--expand-environment=no",
         f"--unit={unit}", f"--property=CPUQuota={VM_CPUS * 100}%", f"--property=MemoryMax={args.memory + 1024}M",
         "--property=MemorySwapMax=0", "--property=TasksMax=128",
         f"--property=RuntimeMaxSec={args.timeout}", "--property=TimeoutStopSec=15s",
@@ -152,7 +152,7 @@ def supervise(args):
         sys.executable, str(Path(__file__).resolve()), f"--_supervised={unit}", *sys.argv[1:],
     ]
     # exec preserves the terminal and exit status; scope startup failure has no fallback.
-    os.execvp(command[0], command)
+    os.execv(command[0], command)
 
 
 @contextmanager
@@ -269,7 +269,7 @@ def main():
             parser.error("update --sudo requires a command")
         if os.getuid() == 0 or os.geteuid() == 0:
             parser.error("virter must run as an unprivileged user; do not use sudo")
-        if shutil.which("bwrap") is None:
+        if shutil.which("/usr/bin/bwrap") is None:
             parser.error("Bubblewrap (bwrap) is required for QEMU confinement")
         if not args._supervised:
             supervise(args)
@@ -342,7 +342,7 @@ def _prepare_or_update(cache_dir: Path, base_image: Path | None, base: str, memo
         except FileExistsError:
             sys.exit(f"Base {base} already exists, choose another base name")
         subprocess.run([
-            "qemu-img",
+            "/usr/bin/qemu-img",
             "resize",
             "-f", "qcow2",
             "-q",
@@ -421,7 +421,7 @@ def _run(args, cache_dir: Path):
     img_path = temp_dir / "disk.img"
     try:
         subprocess.run([
-            "qemu-img",
+            "/usr/bin/qemu-img",
             "create",
             "-q",
             "-f",
@@ -630,7 +630,7 @@ cloud-name: virter
 """, encoding="utf-8")
 
     subprocess.run([
-        "genisoimage",
+        "/usr/bin/genisoimage",
         "-quiet",
         "-output",
         "seed.img",
@@ -646,7 +646,9 @@ cloud-name: virter
 
 
 def cache_directory() -> Path:
-    return Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))) / "virter"
+    configured = Path(os.environ.get("XDG_CACHE_HOME", ""))
+    root = configured if configured.is_absolute() else Path.home() / ".cache"
+    return root.absolute() / "virter"
 
 
 def prepare_cache_dir() -> Path:
@@ -711,7 +713,7 @@ def connect_bridge_backend() -> socket.socket:
 def qemu_confinement(image: Path, temp_dir: Path, network: NetworkMode,
                      backing_image: Path | None) -> list[str]:
     command = [
-        "bwrap", "--unshare-all", "--unshare-user", "--disable-userns", "--assert-userns-disabled",
+        "/usr/bin/bwrap", "--unshare-all", "--unshare-user", "--disable-userns", "--assert-userns-disabled",
         "--die-with-parent",
         "--cap-drop", "ALL", "--clearenv",
         "--setenv", "PATH", "/usr/bin:/bin", "--setenv", "HOME", "/tmp",
@@ -821,7 +823,7 @@ def run_vm(name: str, vm_uuid: str, image: Path, temp_dir: Path, memory_mib: int
             virtiofsd = start(
                 ["/usr/libexec/virtiofsd", "--log-level", "off", "--socket-path", virtiofs_socket, "--shared-dir",
                  mount_dir] + (["--readonly"] if mount_readonly else []),
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                cwd=temp_dir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             wait_for_socket(virtiofsd, virtiofs_socket)
             virtiofs_params += [
                 "-chardev", f"socket,id=char{i},path={qemu_value(virtiofs_socket)}",
@@ -862,7 +864,7 @@ def run_vm(name: str, vm_uuid: str, image: Path, temp_dir: Path, memory_mib: int
              ] if mounts else [])
         )
         try:
-            qemu = start(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            qemu = start(command, cwd=temp_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                          pass_fds=(backend.fileno(),) if backend else ())
             if backend:
                 # QEMU must hold the only client end: passt exits when that end closes.

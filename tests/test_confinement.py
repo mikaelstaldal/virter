@@ -70,7 +70,7 @@ class ConfinementTests(unittest.TestCase):
             v["run_vm"]("safe", "uuid", Path("/cache/instance/disk.img"), Path("/cache/instance"),
                         1024, v["NetworkMode"].NONE, False, [], True, Path("/cache/base.img"))
         args = command.call_args.args[0]
-        self.assertEqual(args[0], "bwrap")
+        self.assertEqual(args[0], "/usr/bin/bwrap")
         for option in ("--unshare-all", "--clearenv", "--die-with-parent",
                        "--disable-userns", "--assert-userns-disabled"):
             self.assertIn(option, args)
@@ -83,6 +83,7 @@ class ConfinementTests(unittest.TestCase):
         self.assertEqual(args[index - 1:index + 2], ["--ro-bind", "/cache/base.img", "/cache/base.img"])
         self.assertIn("on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny", args)
         self.assertEqual(args[args.index("--") + 1], "/usr/bin/qemu-system-x86_64")
+        self.assertEqual(command.call_args.kwargs["cwd"], Path("/cache/instance"))
         command.return_value.wait.assert_any_call()
 
     def test_mount_uses_socket_without_exposing_shared_directory_to_qemu(self):
@@ -98,6 +99,8 @@ class ConfinementTests(unittest.TestCase):
         self.assertIn("socket,id=char0,path=/cache/instance/vhostqemu0", args)
         self.assertIn("memory-backend-file,id=mem,size=1024M,mem-path=/dev/shm,share=on", args)
         self.assertIn("--readonly", command.call_args_list[0].args[0])
+        for call in command.call_args_list:
+            self.assertEqual(call.kwargs["cwd"], Path("/cache/instance"))
         command.return_value.terminate.assert_called()
         command.return_value.wait.assert_any_call(timeout=5)
 

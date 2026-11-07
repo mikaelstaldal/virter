@@ -23,9 +23,10 @@ class ResourceTests(unittest.TestCase):
             run.assert_not_called()
 
     def test_scope_preserves_literal_arguments_and_covers_launcher(self):
-        with patch('sys.argv', ['virter', 'run', '--', 'echo', '$HOME']), patch('os.execvp') as execute:
+        with patch('sys.argv', ['virter', 'run', '--', 'echo', '$HOME']), patch('os.execv') as execute:
             v['supervise'](argparse.Namespace(memory=1024, timeout=60))
         command = execute.call_args.args[1]
+        self.assertEqual(execute.call_args.args[0], '/usr/bin/systemd-run')
         self.assertIn('--scope', command)
         self.assertIn(f'--property=CPUQuota={v["VM_CPUS"] * 100}%', command)
         self.assertIn('--expand-environment=no', command)

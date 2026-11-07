@@ -11,6 +11,13 @@ v = runpy.run_path(str(Path(__file__).resolve().parents[1] / 'virter'))
 
 
 class CacheTests(unittest.TestCase):
+    def test_cache_home_requires_absolute_path(self):
+        for value in ("", ".", "relative/cache"):
+            with self.subTest(value=value), patch.dict(os.environ, XDG_CACHE_HOME=value):
+                self.assertEqual(v['cache_directory'](), Path.home() / '.cache' / 'virter')
+        with patch.dict(os.environ, XDG_CACHE_HOME="/custom/cache"):
+            self.assertEqual(v['cache_directory'](), Path('/custom/cache/virter'))
+
     def test_creation_is_private_with_permissive_umask(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, XDG_CACHE_HOME=directory):
             previous = os.umask(0)
