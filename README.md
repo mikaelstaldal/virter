@@ -134,8 +134,7 @@ Use `--sudo` to run the entire command as root (requires a command):
 ```
 
 Any changes to the file system will be persisted. Updates shut down orderly after the command finishes,
-including when it fails. As with `run`, virter's exit status reports VM execution, not the guest command's
-exit status; check the console output for command failures.
+including when it fails. The `update` exit status reports VM execution; check the console output for command failures.
 Both guest stdout and stderr, plus QEMU diagnostics, appear on virter's stdout.
 
 ## Run an ephemeral instance
@@ -183,6 +182,11 @@ the guest shell even when they cannot be used as a system timezone.
 ```bash
 ./virter run
 ```
+
+For `run`, virter returns the guest command's exit status (or the interactive shell's status).
+It returns 125 if QEMU fails, the guest reports a mount or working-directory failure, or no valid status arrives.
+The status is advisory: the guest user or root can forge success. A guest command can itself return 125.
+Preparation and updates report VM execution status; QEMU failures also return 125 for those operations.
 
 ### With a command and then exit
 

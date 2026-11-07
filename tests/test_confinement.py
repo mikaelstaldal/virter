@@ -36,7 +36,7 @@ class ConfinementTests(unittest.TestCase):
                 (cache / "base.img").touch()
                 command.return_value.wait.return_value = 0
                 with patch.dict(v["main"].__globals__, prepare_cache_dir=lambda: cache,
-                                generate_cloud_init=lambda *a, **k: None,
+                                generate_cloud_init=lambda *a, **k: None, read_guest_status=lambda path: 0,
                                 resource_limits=lambda args: contextlib.nullcontext()):
                     v["main"]()
                 args = command.call_args.args[0]

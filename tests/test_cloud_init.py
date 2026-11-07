@@ -37,16 +37,16 @@ class CloudInitEncodingTests(unittest.TestCase):
                 v['_run'](args, cache)
             data = generate.call_args.kwargs['vendor_data']
         boot, files = data.split('bootcmd:\n')[1].split('write_files:\n')
-        self.assertEqual([json.loads(line[2:]) for line in boot.splitlines()][1:], [
+        self.assertEqual([json.loads(line[2:]) for line in boot.splitlines()][3:], [
             ['mkdir', '-p', '--', str(paths[0])],
             ['mount', '-t', 'virtiofs', '-o', 'ro', 'virtiofs0', str(paths[0])],
             ['mkdir', '-p', '--', str(paths[1])],
             ['mount', '-t', 'virtiofs', 'virtiofs1', str(paths[1])]])
-        setup = json.loads(boot.splitlines()[0][2:])
+        setup = json.loads(boot.splitlines()[2][2:])
         self.assertIn(shlex.join(['usermod', '-G', '', '--', username]), setup[2])
         script = json.loads(files.rsplit('  content: ', 1)[1].strip())
-        self.assertIn('cd ' + shlex.quote(workdir) + '\n', script)
-        self.assertIn(shlex.join(command) + '\n', script)
+        self.assertIn('cd ' + shlex.quote(workdir) + ' || virter_finish 125\n', script)
+        self.assertIn('( ' + shlex.join(command) + ' )\n', script)
         self.assertIn('- path: ' + json.dumps(f'/home/{username}/.profile') + '\n', files)
         self.assertIn('- path: ' + json.dumps(f'/home/{username}/.hushlogin') + '\n', files)
 
@@ -105,12 +105,14 @@ class GuestPrivilegeTests(unittest.TestCase):
                         patch('os.getuid', return_value=1234):
                     v['_run'](args, cache)
                 data = generate.call_args.kwargs['vendor_data']
-                self.assertEqual('bootcmd:' in data, not root)
+                self.assertIn('bootcmd:', data)
                 self.assertEqual('/etc/sudoers.d/90-cloud-init-users' in data, not root)
                 self.assertEqual('/etc/sudoers.d/virter-poweroff' in data, not root)
                 if not root:
                     commands = data.split('bootcmd:\n')[1].split('write_files:\n')[0]
-                    setup, = [json.loads(line[2:]) for line in commands.splitlines()]
+                    owner, serial, setup = [json.loads(line[2:]) for line in commands.splitlines()]
+                    self.assertEqual(owner, ['chown', '1234', '/dev/ttyS2'])
+                    self.assertEqual(serial, ['chmod', '0600', '/dev/ttyS2'])
                     self.assertEqual(setup[:2], ['sh', '-c'])
                     self.assertIn("if ! usermod -G '' -- tester || ! rm -f /etc/sudoers.d/90-cloud-init-users", setup[2])
                     self.assertIn('systemctl mask --runtime --now serial-getty@ttyS1.service', setup[2])
