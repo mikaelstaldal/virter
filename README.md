@@ -19,7 +19,8 @@ QEMU runs with separate user, mount, PID, IPC and UTS namespaces, no capabilitie
 and explicit seccomp restrictions. Its filesystem contains read-only system runtime files, a private `/tmp`
 and `/dev/shm`, `/dev/kvm`, the instance directory and the required disk images. Ephemeral instances see their
 base image read-only; `prepare` and `update` can write their selected base image. Other cache images and the
-user's home are not exposed. Host networking is retained only with `--network host` (also used for image updates).
+user's home are not exposed. Host networking is retained only with `--network host`
+(the default for image preparation and updates).
 This exposes host loopback services and abstract Unix sockets to QEMU. Runs default to `--network none`,
 which disables the guest NIC and isolates QEMU in a separate network namespace.
 `--network bridge` also isolates QEMU's network namespace and uses a filtered passt backend;
@@ -147,7 +148,13 @@ Runs are offline by default (`--network none`). To explicitly enable networking:
 Despite its name, `host` uses QEMU user-mode networking (NAT), not a bridged guest interface.
 It permits unrestricted outbound access to the internet, LAN and host services, including host loopback
 services via the guest-visible host address (normally `10.0.2.2`). NAT does not provide an outbound security
-boundary. Image preparation and updates also use this unrestricted networking.
+boundary. Image preparation and updates default to this unrestricted networking for package access.
+Both accept `--network host|bridge|none`; for example, `./virter update --network none` disables networking.
+Offline preparation may fail if cloud-init needs to download packages.
+
+Only prepare trusted images and never run untrusted code during `update`. All guest disk writes during
+preparation and updates persist in the base image, even with `--network none`. An implant in the base can
+access the network when a later instance enables networking.
 
 For outbound Internet/LAN access with direct host-service isolation, use `./virter run --network bridge`
 after the mandatory [administrator setup](NETWORKING.md); running it needs no sudo. This uses passt and an

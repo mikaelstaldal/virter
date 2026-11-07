@@ -5,7 +5,7 @@ import shlex
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 v = runpy.run_path(str(Path(__file__).resolve().parents[1] / 'virter'))
 
@@ -14,8 +14,10 @@ class UpdateTests(unittest.TestCase):
     def test_update_passes_command_to_persistent_image_setup(self):
         setup = Mock()
         with patch.dict(v['update'].__globals__, prepare_or_update=setup):
-            v['update'](argparse.Namespace(base='custom', memory=2048, COMMAND='echo', ARG=['hello world'], sudo=False))
-        setup.assert_called_once_with(None, 'custom', 2048, None, [], command=['echo', 'hello world'], sudo=False)
+            v['update'](argparse.Namespace(base='custom', memory=2048, COMMAND='echo',
+                                           ARG=['hello world'], sudo=False, network='host'))
+        setup.assert_called_once_with(None, 'custom', 2048, None, [], command=['echo', 'hello world'], sudo=False,
+                                      network=v['NetworkMode'].HOST)
 
     def test_cli_accepts_command_arguments_after_separator(self):
         dispatch = Mock()
@@ -70,10 +72,36 @@ class UpdateTests(unittest.TestCase):
             supervise.side_effect = v['update']
             v['main']()
         self.assertEqual(setup.call_args.kwargs,
-                         {'command': ['sh', '-c', 'apt update && apt -y upgrade'], 'sudo': True})
+                         {'command': ['sh', '-c', 'apt update && apt -y upgrade'], 'sudo': True,
+                          'network': v['NetworkMode'].HOST})
 
     def test_sudo_requires_command(self):
         with patch('sys.argv', ['virter', 'update', '--sudo']), patch('sys.stderr'), \
                 self.assertRaises(SystemExit) as error:
             v['main']()
         self.assertEqual(error.exception.code, 2)
+
+    def test_prepare_and_update_network_selection_reaches_qemu(self):
+        for action in ('prepare', 'update'):
+            for network in ('host', 'bridge', 'none', None):
+                with self.subTest(action=action, network=network), tempfile.TemporaryDirectory() as directory:
+                    cache = Path(directory)
+                    source = cache / 'source.img'
+                    source.touch()
+                    (cache / 'base.img').touch()
+                    argv = ['virter', action]
+                    if action == 'prepare':
+                        argv += ['-i', str(source), '--sha256', '0' * 64]
+                    if network is not None:
+                        argv += ['--network', network]
+                    vm = Mock()
+                    with patch.dict(v['main'].__globals__, supervise=lambda args: args.func(args),
+                                    prepare_cache_dir=lambda: cache, base_lock=MagicMock(),
+                                    base_image_path=lambda *args: cache / ('new.img' if action == 'prepare' else 'base.img'),
+                                    validate_disk_size=Mock(), validate_import=Mock(),
+                                    cloud_init_prepare=Mock(), cloud_init_update=Mock(), run_vm=vm), \
+                            patch('sys.argv', argv), patch('subprocess.run'), \
+                            patch('os.getuid', return_value=1000), patch('os.geteuid', return_value=1000), \
+                            patch('shutil.which', return_value='/usr/bin/bwrap'):
+                        v['main']()
+                    self.assertEqual(vm.call_args.args[5], v['NetworkMode'](network or 'host'))
